@@ -40,7 +40,7 @@ INSERT INTO settings (key, value) VALUES
     ('admin_password_hash', '"$2b$12$placeholder"'),
     ('admin_2fa_code', '"000000"'),
     ('announcement', 'null'),
-    ('binance_id', '"YOUR_BINANCE_ID"'),
+    ('binance_id', '"1184166252"'),
     ('binance_qr_url', '"/binance-qr.png"')
 ON CONFLICT (key) DO NOTHING;
 
