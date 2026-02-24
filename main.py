@@ -453,7 +453,7 @@ def check_domain_whitelist():
     host = request.host.lower().split(':')[0]
     # ===== CHANGE THESE TO YOUR DOMAINS =====
     allowed_domains = [
-        'YOUR_DOMAIN.com', 'www.YOUR_DOMAIN.com',
+        'teamsensi.shop', 'www.teamsensi.shop',
         'YOUR_SERVER_HOST.com', 'localhost', '127.0.0.1'
     ]
     
@@ -988,7 +988,7 @@ def api_verify_device():
             return jsonify({'verified': False, 'checks': {'ip': False}}), 403
         checks['ip'] = True
         # ===== CHANGE THESE TO YOUR DOMAINS =====
-        allowed_origins = ['YOUR_DOMAIN.com', 'YOUR_SERVER_HOST.com', 'localhost', '127.0.0.1']
+        allowed_origins = ['teamsensi.shop', 'YOUR_SERVER_HOST.com', 'localhost', '127.0.0.1']
         checks['domain'] = not origin or any(d in origin for d in allowed_origins)
         suspicious_uas = ['sqlmap', 'nikto', 'nmap', 'masscan', 'dirbuster']
         checks['user_agent'] = bool(user_agent) and not any(s in user_agent.lower() for s in suspicious_uas)
@@ -1438,7 +1438,7 @@ def admin_change_credentials():
         new_2fa_code = data.get('new_2fa_code', '').strip()
         
         # ===== CHANGE THIS SECRET CODE =====
-        if secret_code != 'YOUR_SECRET_CODE':
+        if secret_code != 'Sensi1717SKSPPPPP':
             return jsonify({'error': 'Invalid secret code. Changes not applied.'}), 403
         
         changes = []
