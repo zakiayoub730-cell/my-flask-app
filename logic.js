@@ -1,1549 +1,1197 @@
-#!/usr/bin/env python3
-"""Sensi Reseller Dashboard  - Secure Backend with Supabase
-All sensitive data moved to database (settings table)."""
-import os
+// ==================== CONFIGURATION ====================
+let currentUser = null,
+    isAdmin = false,
+    adminToken = null,
+    sessionToken = null,
+    loginAttempts = 0,
+    adminLoginAttempts = 0,
+    quantity = 1,
+    notifyPosition = 'left',
+    announcementTimer = null,
+    modalTimer = null;
 
-# Load .env file BEFORE anything else
-try:
-    from dotenv import load_dotenv
-    env_paths = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'),
-        os.path.join(os.getcwd(), '.env'),
-        '/home/container/.env',
-        '.env'
-    ]
-    env_loaded = False
-    for env_path in env_paths:
-        if os.path.exists(env_path):
-            load_dotenv(env_path, override=True)
-            print(f"[OK] .env file loaded from: {env_path}")
-            env_loaded = True
-            break
-    if not env_loaded:
-        print("[WARN] No .env file found in any path, using defaults")
-except ImportError:
-    print("[WARN] python-dotenv not installed, using defaults")
-except Exception as e:
-    print(f"[WARN] .env load error: {e}")
+let cachedKeyHistory = [];
+let cachedProducts = [];
+let depositFixedAmounts = [];
 
-from flask import Flask, send_file, send_from_directory, request, jsonify, session, redirect
-from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-import json
-import re
-import requests
-import time
-import uuid
-import hashlib
-import secrets
-import logging
-import bcrypt
-from datetime import datetime, timezone, timedelta
-from functools import wraps
+const MAX_ATTEMPTS = 4;
+const ADMIN_MAX_ATTEMPTS = 3;
 
-# ==================== APP CONFIG ====================
-app = Flask(__name__, static_folder='.', static_url_path='')
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'CHANGE_ME_TO_A_RANDOM_SECRET_KEY')
+// ==================== API HELPER ====================
+async function api(endpoint, options = {}) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (adminToken) headers['X-Admin-Token'] = adminToken;
+    if (sessionToken) headers['X-Session-Token'] = sessionToken;
+    const config = { headers, credentials: 'include', ...options };
+    try {
+        const response = await fetch(endpoint, config);
+        const data = await response.json();
+        if (!response.ok) {
+            if (response.status === 401 && isAdmin && endpoint.startsWith('/api/admin')) {
+                showModal('error', 'Session Expired', 'Admin session expired. Please login again.');
+                setTimeout(() => {
+                    isAdmin = false; adminToken = null;
+                    document.getElementById('view-dashboard').classList.add('hidden');
+                    document.getElementById('bubbles-bg').classList.remove('hidden');
+                    document.getElementById('view-admin-login').classList.remove('hidden');
+                    createBubbles();
+                }, 2000);
+            }
+            throw { status: response.status, ...data };
+        }
+        return data;
+    } catch (err) {
+        if (err.status) throw err;
+        throw { status: 0, error: 'Network error', message: 'Cannot connect to server.' };
+    }
+}
 
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
-app.config['SESSION_COOKIE_SECURE'] = True
-app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_DOMAIN'] = None
+// ==================== ANTI-DEVTOOLS ====================
+let devtoolsLocalCount = 0;
+let devtoolsCooldown = false;
+(function() {
+    function onDevToolsDetected(reason) {
+        if (devtoolsCooldown) return;
+        devtoolsCooldown = true;
+        setTimeout(() => { devtoolsCooldown = false; }, 10000);
+        devtoolsLocalCount++;
+        sendSecurityAlertDevtools('DevTools: ' + reason);
+        if (devtoolsLocalCount >= 3) { showFingerprintThenBan(); }
+    }
+    const isMobile = /Android|iPhone|iPad|iPod|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    if (!isMobile) {
+        let consecutiveDetections = 0;
+        function detectDevTools() {
+            const threshold = 200;
+            const widthDiff = window.outerWidth - window.innerWidth > threshold;
+            const heightDiff = window.outerHeight - window.innerHeight > threshold;
+            if (widthDiff || heightDiff) {
+                consecutiveDetections++;
+                if (consecutiveDetections >= 3) { onDevToolsDetected('window size'); consecutiveDetections = 0; }
+            } else { consecutiveDetections = 0; }
+        }
+        setInterval(detectDevTools, 1000);
+        setInterval(function() {
+            const start = performance.now(); debugger; const end = performance.now();
+            if (end - start > 200) { onDevToolsDetected('debugger paused'); }
+        }, 3000);
+    }
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'i')) || (e.ctrlKey && e.shiftKey && (e.key === 'J' || e.key === 'j')) || (e.ctrlKey && (e.key === 'U' || e.key === 'u'))) {
+            e.preventDefault(); e.stopPropagation();
+            onDevToolsDetected('shortcut: ' + e.key); showNotifyBar(); return false;
+        }
+    });
+})();
+document.addEventListener('contextmenu', function(e) { e.preventDefault(); return false; });
+document.addEventListener('dragstart', function(e) { e.preventDefault(); return false; });
 
-# ===== CHANGE THESE TO YOUR DOMAINS =====
-CORS(app, supports_credentials=True, origins=[
-    'https://teamsensi.shop',
-    'https://www.teamsensi.shop',
-    'https://teamsensi.shop',
-    'https://www.teamsensi.shop',
-    'http://127.0.0.1:20837',
-    'http://127.0.0.1:20837',
-])
+async function sendSecurityAlertDevtools(message) {
+    try {
+        const resp = await fetch('/api/security-alert', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+            body: JSON.stringify({ event: message, is_devtools: true })
+        });
+        const data = await resp.json();
+        if (data.banned) { showFingerprintThenBan(); }
+    } catch (e) {}
+}
 
-def get_client_ip():
-    cf_ip = request.headers.get('CF-Connecting-IP')
-    if cf_ip:
-        return cf_ip
-    forwarded = request.headers.get('X-Forwarded-For')
-    if forwarded:
-        return forwarded.split(',')[0].strip()
-    return request.headers.get('X-Real-IP', request.remote_addr)
+async function sendSecurityAlert(message) {
+    try {
+        await fetch('/api/security-alert', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+            body: JSON.stringify({ event: message })
+        });
+    } catch (e) {}
+}
 
-limiter = Limiter(
-    app=app,
-    key_func=get_client_ip,
-    default_limits=["200 per minute"],
-    storage_uri="memory://"
-)
+// ==================== DATE FORMATTING ====================
+function formatDateTime(date) {
+    if (!(date instanceof Date) || isNaN(date)) date = new Date();
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const year = date.getFullYear();
+    let hours = date.getHours();
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12 || 12;
+    return `${day}/${month}/${year} ${String(hours).padStart(2, '0')}:${minutes} ${ampm}`;
+}
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+// ==================== INITIALIZATION ====================
+window.addEventListener('load', async () => {
+    // Always verify ban status with server first (not just localStorage)
+    try {
+        const banCheck = await api('/api/check-ban');
+        if (banCheck.banned) { showBanScreen(); return; }
+        else {
+            // Server says not banned - clear any stale localStorage ban
+            localStorage.removeItem('abrdns_perm_ban');
+            if (window.location.hash === '#banned') { window.location.hash = ''; }
+        }
+    } catch (e) {
+        if (e.status === 403) { showBanScreen(); return; }
+        // If server is unreachable, fallback to localStorage check
+        const banData = localStorage.getItem('abrdns_perm_ban');
+        if (banData || window.location.hash === '#banned') { showBanScreen(); return; }
+    }
+    if (window.location.hash === '#admin') {
+        document.getElementById('view-gateway').classList.add('hidden');
+        document.getElementById('bubbles-bg').classList.remove('hidden');
+        document.getElementById('view-admin-login').classList.remove('hidden');
+        createBubbles();
+    } else { startGatewaySequence(); }
+    setupSecurity();
+    const banDurationSelect = document.getElementById('admin-ban-duration');
+    if (banDurationSelect) {
+        banDurationSelect.addEventListener('change', function() {
+            const customInput = document.getElementById('admin-ban-custom-minutes');
+            this.value === 'custom' ? customInput.classList.remove('hidden') : customInput.classList.add('hidden');
+        });
+    }
+    const modalOverlay = document.getElementById('modal-overlay');
+    if (modalOverlay) { modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); }); }
+});
 
-# ==================== SUPABASE CONFIG ====================
-SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
-SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
+// ==================== SECURITY ====================
+function setupSecurity() {
+    document.addEventListener('contextmenu', (e) => { e.preventDefault(); showNotifyBar(); });
+    document.addEventListener('selectstart', (e) => { if (!e.target.closest('.key-item, .history-key, .admin-key-item, .deposit-qr-img, .deposit-qr-frame, .deposit-id-value')) { e.preventDefault(); showNotifyBar(); } });
+    document.addEventListener('copy', (e) => { if (!e.target.closest('.key-item, .history-key, .admin-key-item, .deposit-id-value')) { e.preventDefault(); showNotifyBar(); } });
+}
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("[ERROR] SUPABASE_URL or SUPABASE_KEY not set in .env!")
-else:
-    print(f"[OK] Supabase URL: {SUPABASE_URL}")
-    print(f"[OK] Supabase Key: {SUPABASE_KEY[:25]}...")
+function showNotifyBar() {
+    const bar = document.getElementById('notify-bar');
+    bar.classList.remove('show-left', 'show-right');
+    void bar.offsetWidth;
+    bar.classList.add('show-right');
+    setTimeout(() => bar.classList.remove('show-left', 'show-right'), 2500);
+}
 
-# ==================== BCRYPT HELPERS ====================
-def hash_password(plain_password):
-    return bcrypt.hashpw(plain_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+// ==================== BAN SCREEN ====================
+function showBanScreen() {
+    const allViews = ['view-gateway', 'view-login', 'view-security-scan', 'view-dashboard', 'bubbles-bg', 'view-admin-login', 'view-fingerprint-verify', 'view-post-login-verify', 'view-admin-2fa-code'];
+    allViews.forEach(id => { const el = document.getElementById(id); if (el) el.classList.add('hidden'); });
+    const banView = document.getElementById('view-banned');
+    if (banView) {
+        banView.classList.remove('hidden'); banView.style.display = 'flex';
+        fetch('/api/get-client-ip', { credentials: 'include' }).then(r => r.json()).then(data => {
+            const ipDisplay = document.getElementById('banned-ip-display');
+            if (ipDisplay && data.ip) { ipDisplay.innerText = data.ip; }
+        }).catch(() => { document.getElementById('banned-ip-display').innerText = 'Unknown'; });
+    }
+    localStorage.setItem('abrdns_perm_ban', JSON.stringify({ banned: true, time: Date.now() }));
+}
 
-def verify_password(plain_password, hashed_password):
-    try:
-        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
-    except (ValueError, AttributeError):
-        return plain_password == hashed_password
+function copyBannedIP() {
+    const ipDisplay = document.getElementById('banned-ip-display');
+    if (ipDisplay) {
+        const ip = ipDisplay.innerText;
+        if (ip && ip !== '-' && ip !== 'Unknown') {
+            navigator.clipboard.writeText(ip).catch(() => {});
+        }
+    }
+}
 
-def upgrade_password_if_needed(username, plain_password, stored_password):
-    try:
-        bcrypt.checkpw(plain_password.encode('utf-8'), stored_password.encode('utf-8'))
-        return
-    except (ValueError, AttributeError):
-        try:
-            sb = get_supabase()
-            hashed = hash_password(plain_password)
-            sb.table('users').update({'password': hashed}).eq('username', username).execute()
-            logger.info(f"Upgraded password hash for user: {username}")
-        except Exception as e:
-            logger.error(f"Password upgrade error for {username}: {e}")
+async function showFingerprintThenBan() { await showFingerprintVerify(false); }
 
-# ==================== IN-MEMORY TRACKING ====================
-failed_login_attempts = {}
-failed_admin_attempts = {}
-memory_banned_ips = {}
-devtools_attempts = {}
-active_admin_tokens = set()
+// ==================== BUBBLES ====================
+function createBubbles() {
+    const bg = document.getElementById('bubbles-bg'); bg.innerHTML = '';
+    const colors = ['purple', 'blue', 'pink', 'cyan'];
+    for (let i = 0; i < 20; i++) {
+        const bubble = document.createElement('div');
+        bubble.className = `bubble ${colors[Math.floor(Math.random() * colors.length)]}`;
+        const size = Math.random() * 160 + 40;
+        bubble.style.width = bubble.style.height = size + 'px';
+        bubble.style.left = Math.random() * 100 + '%';
+        bubble.style.animationDuration = (Math.random() * 12 + 10) + 's';
+        bubble.style.animationDelay = -(Math.random() * 20) + 's';
+        bg.appendChild(bubble);
+    }
+}
 
-MAX_USER_ATTEMPTS = 4
-MAX_ADMIN_ATTEMPTS = 3
-MAX_DEVTOOLS_ATTEMPTS = 3
-ALERT_USER_ATTEMPTS = 2
-ALERT_ADMIN_ATTEMPTS = 1
-ALERT_DEVTOOLS_ATTEMPTS = 2
+// ==================== FINGERPRINT ====================
+function generateFingerprint() {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    ctx.textBaseline = 'top'; ctx.font = '14px Arial'; ctx.fillText('fp_check', 2, 2);
+    const canvasHash = canvas.toDataURL().slice(-32);
+    const data = [navigator.userAgent, navigator.language, screen.width + 'x' + screen.height, screen.colorDepth, new Date().getTimezoneOffset(), navigator.hardwareConcurrency || 'unknown', navigator.platform, canvasHash].join('|');
+    let hash = 0;
+    for (let i = 0; i < data.length; i++) { const char = data.charCodeAt(i); hash = ((hash << 5) - hash) + char; hash = hash & hash; }
+    return Math.abs(hash).toString(36) + Date.now().toString(36);
+}
 
-# ==================== SETTINGS CACHE ====================
-_settings_cache = {}
-_settings_cache_time = 0
-SETTINGS_CACHE_TTL = 120  # Cache settings for 2 minutes (reduces DB calls significantly)
+// ==================== GATEWAY ====================
+async function startGatewaySequence() {
+    const gateway = document.getElementById('view-gateway');
+    const bar = document.getElementById('gateway-progress');
+    const text = document.getElementById('gateway-text');
+    text.innerText = 'Checking browser...'; await animateProgress(bar, 0, 30, 800);
+    text.innerText = 'Verifying domain...'; await animateProgress(bar, 30, 60, 800);
+    text.innerText = 'Verifying device...';
+    let verified = false;
+    try {
+        const fingerprint = generateFingerprint();
+        const resp = await fetch('/api/verify-device', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ fingerprint }) });
+        const result = await resp.json();
+        verified = result.verified;
+        if (result.banned) { showBanScreen(); return; }
+    } catch (e) { verified = true; }
+    await animateProgress(bar, 60, 85, 600);
+    text.innerText = verified ? 'Preparing dashboard...' : 'Verification failed...';
+    await animateProgress(bar, 85, 100, 500);
+    if (!verified) { showFingerprintVerify(false); return; }
+    gateway.style.opacity = '0';
+    setTimeout(() => {
+        gateway.classList.add('hidden');
+        document.getElementById('bubbles-bg').classList.remove('hidden');
+        document.getElementById('view-login').classList.remove('hidden');
+        createBubbles();
+    }, 600);
+}
 
-def get_setting(key, default=None):
-    """Get a setting from database with caching."""
-    global _settings_cache, _settings_cache_time
-    now = time.time()
-    if now - _settings_cache_time > SETTINGS_CACHE_TTL:
-        try:
-            sb = get_supabase()
-            result = sb.table('settings').select('key, value').execute()
-            _settings_cache = {}
-            for row in result.data:
-                val = row['value']
-                _settings_cache[row['key']] = val
-            _settings_cache_time = now
-        except Exception as e:
-            logger.error(f"Settings cache refresh error: {e}")
-    return _settings_cache.get(key, default)
+function animateProgress(bar, from, to, duration) {
+    return new Promise(resolve => {
+        const steps = to - from; const stepTime = duration / steps; let current = from;
+        const interval = setInterval(() => { current++; bar.style.width = current + '%'; if (current >= to) { clearInterval(interval); resolve(); } }, stepTime);
+    });
+}
 
-def set_setting(key, value):
-    """Update a setting in database. Value is stored as JSONB."""
-    global _settings_cache_time
-    try:
-        sb = get_supabase()
-        existing = sb.table('settings').select('id').eq('key', key).execute()
-        if existing.data:
-            sb.table('settings').update({'value': value, 'updated_at': datetime.now(timezone.utc).isoformat()}).eq('key', key).execute()
-        else:
-            sb.table('settings').insert({'key': key, 'value': value}).execute()
-        _settings_cache[key] = value
-        _settings_cache_time = 0  # Force refresh
-        return True
-    except Exception as e:
-        logger.error(f"Set setting error: {e}")
-        return False
+// ==================== FINGERPRINT VERIFICATION ====================
+async function showFingerprintVerify(willPass) {
+    ['view-gateway', 'view-login', 'view-dashboard', 'bubbles-bg', 'view-admin-login', 'view-security-scan', 'view-post-login-verify', 'view-admin-2fa-code'].forEach(id => { const el = document.getElementById(id); if (el) el.classList.add('hidden'); });
+    const view = document.getElementById('view-fingerprint-verify');
+    const checksEl = document.getElementById('fp-checks');
+    const bar = document.getElementById('fp-verify-progress');
+    const textEl = document.getElementById('fp-verify-text');
+    view.classList.remove('hidden');
+    const checks = [
+        { id: 'ip', label: 'IP Address Validation', icon: 'fa-network-wired' },
+        { id: 'domain', label: 'Domain Verification', icon: 'fa-globe' },
+        { id: 'user_agent', label: 'Browser Analysis', icon: 'fa-desktop' },
+        { id: 'fingerprint', label: 'Device Verification', icon: 'fa-fingerprint' },
+        { id: 'rate', label: 'Request Rate Check', icon: 'fa-gauge-high' }
+    ];
+    checksEl.innerHTML = checks.map(c => `<div class="fp-check-item" id="fp-check-${c.id}"><span class="fp-check-icon"><i class="fa-solid fa-circle-notch"></i></span><span class="fp-check-label">${c.label}</span></div>`).join('');
+    bar.style.width = '0%'; textEl.innerText = 'Scanning device fingerprint...';
+    let serverResult = null;
+    try {
+        const fingerprint = generateFingerprint();
+        const resp = await fetch('/api/verify-device', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include', body: JSON.stringify({ fingerprint }) });
+        serverResult = await resp.json();
+    } catch (e) { serverResult = { verified: willPass, checks: { ip: true, domain: true, user_agent: true, fingerprint: true, rate: true } }; }
+    for (let i = 0; i < checks.length; i++) {
+        const check = checks[i]; const el = document.getElementById('fp-check-' + check.id);
+        el.classList.add('checking'); el.querySelector('.fp-check-icon').innerHTML = '<i class="fa-solid fa-spinner"></i>';
+        textEl.innerText = check.label + '...';
+        await new Promise(r => setTimeout(r, 600 + Math.random() * 400));
+        const passed = serverResult.checks ? serverResult.checks[check.id] : willPass;
+        el.classList.remove('checking'); el.classList.add(passed ? 'passed' : 'failed');
+        el.querySelector('.fp-check-icon').innerHTML = passed ? '<i class="fa-solid fa-check"></i>' : '<i class="fa-solid fa-xmark"></i>';
+        bar.style.width = ((i + 1) / checks.length * 100) + '%';
+    }
+    await new Promise(r => setTimeout(r, 500));
+    if (!serverResult.verified) {
+        textEl.innerText = 'VERIFICATION FAILED'; textEl.style.color = '#ef4444';
+        await new Promise(r => setTimeout(r, 1500)); view.classList.add('hidden'); showBanScreen();
+    } else {
+        textEl.innerText = 'Device verified successfully'; textEl.style.color = '#22c55e';
+        await new Promise(r => setTimeout(r, 800)); view.classList.add('hidden'); textEl.style.color = ''; return true;
+    }
+    return false;
+}
 
-# ==================== ERROR HELPER ====================
-def make_error_response(e, context="Operation"):
-    err_str = str(e).lower()
-    if 'supabase' in err_str or 'key' in err_str or 'not configured' in err_str:
-        msg = 'Service temporarily unavailable. Please try again later.'
-        logger.error(f"Database config error: {e}")
-    else:
-        msg = 'An unexpected error occurred. Please try again.'
-        logger.error(f"Server error: {e}")
-    return jsonify({'error': msg, 'message': msg}), 500
+// ==================== POST-LOGIN VERIFICATION ====================
+async function showPostLoginVerify() {
+    ['view-login', 'bubbles-bg'].forEach(id => { const el = document.getElementById(id); if (el) el.classList.add('hidden'); });
+    const view = document.getElementById('view-post-login-verify');
+    const checksEl = document.getElementById('post-login-checks');
+    const bar = document.getElementById('post-login-progress');
+    const textEl = document.getElementById('post-login-text');
+    view.classList.remove('hidden');
+    const steps = [
+        { label: 'Validating session token...', delay: 500 },
+        { label: 'Checking account status...', delay: 600 },
+        { label: 'Loading user permissions...', delay: 400 },
+        { label: 'Encrypting connection...', delay: 500 },
+        { label: 'Session secured', delay: 300 }
+    ];
+    checksEl.innerHTML = steps.map((s, i) => `<div class="fp-check-item" id="pl-check-${i}"><span class="fp-check-icon"><i class="fa-solid fa-circle-notch"></i></span><span class="fp-check-label">${s.label}</span></div>`).join('');
+    bar.style.width = '0%';
+    let sessionValid = true;
+    try {
+        const result = await api('/api/get-data?username=' + encodeURIComponent(currentUser.username));
+        if (result.is_banned) sessionValid = false;
+    } catch (e) { sessionValid = false; }
+    for (let i = 0; i < steps.length; i++) {
+        const el = document.getElementById('pl-check-' + i);
+        el.classList.add('checking'); el.querySelector('.fp-check-icon').innerHTML = '<i class="fa-solid fa-spinner"></i>';
+        textEl.innerText = steps[i].label;
+        await new Promise(r => setTimeout(r, steps[i].delay));
+        el.classList.remove('checking'); el.classList.add(sessionValid ? 'passed' : 'failed');
+        el.querySelector('.fp-check-icon').innerHTML = sessionValid ? '<i class="fa-solid fa-check"></i>' : '<i class="fa-solid fa-xmark"></i>';
+        bar.style.width = ((i + 1) / steps.length * 100) + '%';
+    }
+    await new Promise(r => setTimeout(r, 600));
+    if (!sessionValid) {
+        textEl.innerText = 'Session verification failed'; textEl.style.color = '#ef4444';
+        await new Promise(r => setTimeout(r, 1500)); view.classList.add('hidden'); showBanScreen(); return false;
+    }
+    textEl.innerText = 'Session verified'; textEl.style.color = '#22c55e';
+    await new Promise(r => setTimeout(r, 500)); view.classList.add('hidden'); textEl.style.color = ''; return true;
+}
 
-# ==================== SUPABASE CLIENT ====================
-_supabase_client = None
-_supabase_last_check = 0
-_supabase_health_interval = 300  # Check health every 5 minutes (less overhead)
-DB_MAX_RETRIES = 3
-DB_RETRY_DELAY = 0.3
+// ==================== PASSWORD TOGGLE ====================
+function togglePassword() {
+    const passInput = document.getElementById('login-pass'); const icon = document.getElementById('toggle-pass');
+    const isPass = passInput.type === 'password';
+    passInput.type = isPass ? 'text' : 'password';
+    icon.classList.replace(isPass ? 'fa-eye' : 'fa-eye-slash', isPass ? 'fa-eye-slash' : 'fa-eye');
+}
 
-import threading
-_supabase_lock = threading.Lock()
+// ==================== USER LOGIN ====================
+async function attemptLogin() {
+    const userIn = document.getElementById('login-user').value.trim();
+    const passIn = document.getElementById('login-pass').value;
+    const btn = document.getElementById('btn-login');
+    const btnText = document.getElementById('btn-login-text');
+    const spinner = document.getElementById('login-spinner');
+    const arrow = document.getElementById('btn-login-arrow');
+    if (!userIn || !passIn) { showLoginError('Please enter username and password.'); return; }
+    btn.disabled = true; btnText.innerText = 'AUTHENTICATING...'; spinner.style.display = 'block'; arrow.style.display = 'none';
+    try {
+        const result = await api('/api/login', { method: 'POST', body: JSON.stringify({ username: userIn, password: passIn }) });
+        if (result.success) {
+            currentUser = { username: result.username, balance: result.balance }; sessionToken = result.token; loginAttempts = 0;
+            const verified = await showPostLoginVerify();
+            if (!verified) return;
+            document.getElementById('view-post-login-verify').classList.add('hidden');
+            document.getElementById('view-dashboard').classList.remove('hidden');
+            document.getElementById('dash-username').innerText = userIn;
+            preloadDashboardData();
+            if (window.restoreUserViewState) { window.restoreUserViewState(); }
+            else { switchTab('tab-generator', document.querySelector('[onclick*="tab-generator"]')); }
+            checkAnnouncement();
+        }
+    } catch (err) {
+        loginAttempts++;
+        if (err.error === 'IP_BANNED') { await showFingerprintThenBan(); return; }
+        if (err.error === 'BANNED') { showLoginError('Your account has been banned.'); }
+        else {
+            const remaining = err.remaining !== undefined ? err.remaining : Math.max(0, MAX_ATTEMPTS - loginAttempts);
+            if (remaining <= 0) { await showFingerprintThenBan(); return; }
+            showLoginError(err.message || `Authentication Failed. ${remaining} attempts remaining.`);
+        }
+    }
+    resetLoginBtn();
+}
 
-def get_supabase():
-    global _supabase_client, _supabase_last_check
-    current_time = time.time()
+function resetLoginBtn() {
+    const btn = document.getElementById('btn-login'); const btnText = document.getElementById('btn-login-text');
+    const spinner = document.getElementById('login-spinner'); const arrow = document.getElementById('btn-login-arrow');
+    btn.disabled = false; btnText.innerText = 'SIGN IN'; spinner.style.display = 'none'; arrow.style.display = 'block';
+}
+
+function showLoginError(msg) {
+    const err = document.getElementById('login-error'); const errText = document.getElementById('login-error-text');
+    if (errText) errText.innerText = msg; else err.innerText = msg;
+    err.classList.remove('hidden');
+    const card = document.getElementById('login-card'); card.style.animation = 'shake 0.4s ease';
+    setTimeout(() => card.style.animation = '', 400);
+}
+
+async function logout() {
+    currentUser = null; isAdmin = false; sessionToken = null; adminToken = null;
+    sessionStorage.clear();
+    try { await fetch('/api/logout', { method: 'POST', credentials: 'include' }); } catch (e) {}
+    document.getElementById('view-dashboard').classList.add('hidden');
+    document.getElementById('bubbles-bg').classList.remove('hidden');
+    document.getElementById('view-login').classList.remove('hidden');
+    document.getElementById('login-user').value = document.getElementById('login-pass').value = '';
+    document.getElementById('login-error').classList.add('hidden');
+    createBubbles();
+}
+
+// ==================== ANNOUNCEMENT ====================
+async function checkAnnouncement() {
+    try {
+        const result = await api('/api/announcement');
+        if (result.announcement && result.announcement.content) {
+            document.getElementById('announcement-body').innerText = result.announcement.content;
+            document.getElementById('announcement-overlay').classList.remove('hidden');
+            if (announcementTimer) clearTimeout(announcementTimer);
+            announcementTimer = setTimeout(closeAnnouncement, 5000);
+        }
+    } catch (e) {}
+}
+
+function closeAnnouncement() {
+    document.getElementById('announcement-overlay').classList.add('hidden');
+    if (announcementTimer) { clearTimeout(announcementTimer); announcementTimer = null; }
+}
+
+// ==================== BALANCE ====================
+async function updateBalance() {
+    if (!currentUser) return;
+    try {
+        const result = await api('/api/get-data?username=' + encodeURIComponent(currentUser.username));
+        if (result.username) {
+            currentUser.balance = result.balance;
+            document.getElementById('dash-balance').innerText = '$' + parseFloat(currentUser.balance).toFixed(2);
+        }
+    } catch (e) {}
+}
+
+// ==================== PRELOAD DATA ====================
+async function preloadDashboardData() {
+    const promises = [];
+    if (currentUser && !isAdmin) {
+        promises.push(updateBalance()); promises.push(loadProductDropdowns());
+        promises.push(updateStatistics()); promises.push(updateHistory()); promises.push(updateTransactions());
+    }
+    try { await Promise.allSettled(promises); } catch (e) {}
+}
+
+// ==================== PRODUCTS ====================
+async function loadProductDropdowns() {
+    try {
+        const result = await api('/api/products'); cachedProducts = result.products || [];
+        const genProduct = document.getElementById('gen-product');
+        genProduct.innerHTML = '<option value="">Select Product</option>';
+        cachedProducts.forEach(p => { const opt = document.createElement('option'); opt.value = p.id; opt.innerText = p.name; genProduct.appendChild(opt); });
+        const adminKeyProduct = document.getElementById('admin-key-product');
+        if (adminKeyProduct) {
+            adminKeyProduct.innerHTML = '<option value="">Select Product</option>';
+            cachedProducts.forEach(p => { const opt = document.createElement('option'); opt.value = p.id; opt.innerText = p.name; adminKeyProduct.appendChild(opt); });
+        }
+    } catch (e) {}
+}
+
+function updateValidityDropdown() {
+    const productId = parseInt(document.getElementById('gen-product').value);
+    const product = cachedProducts.find(p => p.id === productId);
+    const validitySelect = document.getElementById('gen-validity');
+    validitySelect.innerHTML = '<option value="">Select Duration</option>';
+    if (product && product.durations) {
+        product.durations.forEach(d => { const opt = document.createElement('option'); opt.value = d.days; opt.innerText = `${d.days} Days - $${d.price}`; validitySelect.appendChild(opt); });
+    }
+}
+
+function changeQty(n) { quantity = Math.max(1, quantity + n); document.getElementById('qty-display').innerText = quantity; }
+
+// ==================== KEY GENERATION ====================
+let pendingKeyGeneration = null;
+function generateKeys() {
+    const productId = parseInt(document.getElementById('gen-product').value);
+    const days = parseInt(document.getElementById('gen-validity').value);
+    const product = cachedProducts.find(p => p.id === productId);
+    if (!product) { showToast('error', 'Please select a valid product'); return; }
+    const duration = product.durations.find(d => d.days === days);
+    if (!duration) { showToast('error', 'Please select a valid duration'); return; }
+    const totalCost = (parseFloat(duration.price) * quantity).toFixed(2);
+    pendingKeyGeneration = { productId, days, quantity, product, duration };
+    const confirmMsg = document.getElementById('confirm-msg');
+    confirmMsg.innerHTML = `<div style="text-align:left;background:rgba(139,92,246,0.08);border:1px solid rgba(139,92,246,0.2);border-radius:8px;padding:12px;margin-bottom:8px;">
+        <div style="margin-bottom:6px;"><strong style="color:#a78bfa;">Product:</strong> <span style="color:#e2e8f0;">${product.name}</span></div>
+        <div style="margin-bottom:6px;"><strong style="color:#a78bfa;">Duration:</strong> <span style="color:#e2e8f0;">${days} Days</span></div>
+        <div style="margin-bottom:6px;"><strong style="color:#a78bfa;">Quantity:</strong> <span style="color:#e2e8f0;">${quantity}</span></div>
+        <div><strong style="color:#ef4444;">Total Cost:</strong> <span style="color:#ef4444;font-weight:700;">$${totalCost}</span></div>
+    </div><div style="color:#9ca3af;font-size:12px;">This will be deducted from your balance.</div>`;
+    const overlay = document.getElementById('confirm-overlay');
+    overlay.classList.remove('hidden'); overlay.classList.add('show');
+}
+
+async function confirmGenerate() {
+    if (!pendingKeyGeneration) return;
+    const { productId, days } = pendingKeyGeneration; const qty = pendingKeyGeneration.quantity;
+    cancelConfirm();
+    try {
+        const result = await api('/api/generate-keys', { method: 'POST', body: JSON.stringify({ username: currentUser.username, product_id: productId, days: days, quantity: qty }) });
+        if (result.success) {
+            currentUser.balance = result.new_balance;
+            document.getElementById('dash-balance').innerText = '$' + parseFloat(result.new_balance).toFixed(2);
+            const resultDiv = document.getElementById('keys-result');
+            resultDiv.classList.remove('hidden');
+            resultDiv.innerHTML = `<div class="keys-result-title"><i class="fa-solid fa-check-circle"></i> ${result.keys.length} Key(s) Generated!</div>${result.keys.map(k => `<div class="key-item"><span class="key-text">${k}</span><i class="fa-solid fa-copy copy-icon" onclick="event.stopPropagation(); copyKey('${k}', this.parentElement)"></i></div>`).join('')}`;
+            showToast('success', `${result.keys.length} key(s) generated! -$${result.total_cost.toFixed(2)}`);
+        }
+    } catch (err) { showToast('error', err.error || err.message || 'Failed to generate keys'); }
+    pendingKeyGeneration = null;
+}
+
+function cancelConfirm() {
+    const overlay = document.getElementById('confirm-overlay');
+    overlay.classList.remove('show'); setTimeout(() => overlay.classList.add('hidden'), 300);
+    pendingKeyGeneration = null;
+}
+
+function copyKey(key, el) {
+    navigator.clipboard.writeText(key).then(() => highlightCopied(el)).catch(() => {
+        const ta = document.createElement('textarea'); ta.value = key; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); highlightCopied(el);
+    });
+}
+
+function highlightCopied(el) { if (el) { el.style.background = 'rgba(16, 185, 129, 0.2)'; setTimeout(() => el.style.background = '', 1000); } }
+
+// ==================== STATISTICS ====================
+async function updateStatistics() {
+    try {
+        const histResult = await api('/api/key-history?username=' + encodeURIComponent(currentUser.username));
+        const keys = histResult.history || []; cachedKeyHistory = keys;
+        document.getElementById('stat-total').innerText = keys.length;
+        const prodResult = await api('/api/products'); const products = prodResult.products || [];
+        const breakdown = {};
+        products.forEach(p => p.durations.forEach(d => breakdown[`${p.name} ${d.days} DAY`] = 0));
+        keys.forEach(k => { const label = `${k.product_name} ${k.days} DAY`; if (breakdown[label] !== undefined) breakdown[label]++; });
+        const tbody = document.getElementById('stat-breakdown');
+        tbody.innerHTML = Object.entries(breakdown).map(([product, count]) => `<tr><td style="text-align:left;"><i class="fa-solid fa-key" style="color:#8b5cf6;margin-right:8px;"></i>${product}</td><td style="text-align:center;font-weight:700;color:#a78bfa;">${count}</td></tr>`).join('');
+    } catch (e) {}
+}
+
+// ==================== HISTORY ====================
+async function updateHistory() {
+    try {
+        const result = await api('/api/key-history?username=' + encodeURIComponent(currentUser.username));
+        const keys = result.history || []; cachedKeyHistory = keys;
+        const tbody = document.getElementById('history-tbody'); const emptyMsg = document.getElementById('history-empty');
+        tbody.innerHTML = '';
+        if (keys.length === 0) { emptyMsg.style.display = 'block'; return; }
+        emptyMsg.style.display = 'none';
+        keys.forEach((k, idx) => {
+            const dateStr = formatDateTime(new Date(k.created_at));
+            const keyValue = k.key_code || k.key_value || '';
+            const truncKey = keyValue.length > 14 ? 'Key: ' + keyValue.substring(0, 10) + '...' : keyValue;
+            tbody.innerHTML += `<tr><td style="text-align:center;color:#a78bfa;font-weight:600;">${idx + 1}</td><td style="text-align:center;"><span class="history-key" onclick="copyKey('${keyValue}', this)" title="Click to copy">${truncKey}</span></td><td style="text-align:center;">${k.days}</td><td style="text-align:center;">${dateStr}</td></tr>`;
+        });
+    } catch (e) {}
+}
+
+// ==================== TRANSACTIONS ====================
+async function updateTransactions() {
+    try {
+        const result = await api('/api/transactions?username=' + encodeURIComponent(currentUser.username));
+        const txs = result.transactions || [];
+        const container = document.getElementById('transactions-list'); const emptyMsg = document.getElementById('transactions-empty');
+        container.innerHTML = '';
+        if (txs.length === 0) { emptyMsg.style.display = 'block'; return; }
+        emptyMsg.style.display = 'none';
+        txs.forEach(t => {
+            const dateStr = formatDateTime(new Date(t.created_at));
+            let icon, iconClass, typeLabel, amountStr, amountColor;
+            if (t.type === 'Deposit') { icon = 'fa-arrow-down'; iconClass = 'deposit'; typeLabel = 'Deposit'; amountStr = `+$${Math.abs(parseFloat(t.amount)).toFixed(2)}`; amountColor = '#10b981'; }
+            else if (t.type === 'Deduction') { icon = 'fa-arrow-up'; iconClass = 'deduction'; typeLabel = 'Deduction'; amountStr = `-$${Math.abs(parseFloat(t.amount)).toFixed(2)}`; amountColor = '#ef4444'; }
+            else if (t.type === 'Key Purchase') { icon = 'fa-key'; iconClass = 'purchase'; typeLabel = 'Key Purchase'; amountStr = `-$${Math.abs(parseFloat(t.amount)).toFixed(2)}`; amountColor = '#a78bfa'; }
+            else { icon = 'fa-circle-info'; iconClass = 'deposit'; typeLabel = t.type || 'Transaction'; amountStr = `$${Math.abs(parseFloat(t.amount)).toFixed(2)}`; amountColor = '#9ca3af'; }
+            container.innerHTML += `<div class="transaction-item" style="border-color:${amountColor}22;"><div class="tx-left"><div class="tx-icon ${iconClass}"><i class="fa-solid ${icon}"></i></div><div class="tx-details"><div class="tx-type">${typeLabel}</div><div class="tx-date">${dateStr}</div></div></div><div class="tx-amount" style="color:${amountColor};">${amountStr}</div></div>`;
+        });
+    } catch (e) {}
+}
+
+// ==================== ADMIN LOGIN ====================
+let adminSavedPassword = null;
+async function adminLogin() {
+    const pass = document.getElementById('admin-pass-input').value;
+    if (!pass) return;
+    try {
+        const result = await api('/api/admin-login', { method: 'POST', body: JSON.stringify({ password: pass }) });
+        if (result.error === 'NEED_2FA') {
+            adminSavedPassword = pass;
+            document.getElementById('view-admin-login').classList.add('hidden');
+            document.getElementById('view-admin-2fa-code').classList.remove('hidden');
+            document.getElementById('admin-2fa-input').value = '';
+            document.getElementById('admin-2fa-error').classList.add('hidden');
+            document.getElementById('admin-2fa-input').focus();
+        }
+    } catch (err) {
+        adminLoginAttempts++;
+        if (err.error === 'IP_BANNED' || err.status === 403) { await showFingerprintThenBan(); return; }
+        const errorText = document.getElementById('admin-login-error-text');
+        errorText.innerText = err.message || 'Authentication failed.';
+        document.getElementById('admin-login-error').classList.remove('hidden');
+    }
+}
+
+async function submitAdmin2FA() {
+    const code = document.getElementById('admin-2fa-input').value.trim();
+    if (!code) return;
+    const btn = document.getElementById('btn-admin-2fa'); const btnText = document.getElementById('btn-admin-2fa-text');
+    const spinner = document.getElementById('admin-2fa-spinner'); const arrow = document.getElementById('btn-admin-2fa-arrow');
+    btn.disabled = true; btnText.innerText = 'VERIFYING...'; spinner.style.display = 'block'; arrow.style.display = 'none';
+    try {
+        const loginResult = await api('/api/admin-login', { method: 'POST', body: JSON.stringify({ password: adminSavedPassword, twofa_code: code }) });
+        if (loginResult.success) {
+            isAdmin = true; adminLoginAttempts = 0; adminToken = loginResult.token;
+            currentUser = { username: 'Admin', balance: 0 };
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.getElementById('tab-admin').classList.add('active');
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            const adminNavItem = document.querySelector('[onclick*="tab-admin"]');
+            if (adminNavItem) adminNavItem.classList.add('active');
+            document.getElementById('view-admin-2fa-code').classList.add('hidden');
+            document.getElementById('bubbles-bg').classList.add('hidden');
+            document.getElementById('view-dashboard').classList.remove('hidden');
+            document.getElementById('dash-username').innerText = 'Admin';
+            document.getElementById('dash-balance').innerText = 'ADMIN';
+            const menuToggle = document.querySelector('.menu-toggle');
+            if (menuToggle) menuToggle.style.display = 'none';
+            await Promise.allSettled([
+                typeof loadAdminUserDropdowns === 'function' ? loadAdminUserDropdowns() : Promise.resolve(),
+                typeof renderAdminUsers === 'function' ? renderAdminUsers() : Promise.resolve(),
+                typeof renderAdminProducts === 'function' ? renderAdminProducts() : Promise.resolve(),
+                typeof renderAdminKeyPool === 'function' ? renderAdminKeyPool() : Promise.resolve(),
+                typeof renderAdminBannedIPs === 'function' ? renderAdminBannedIPs() : Promise.resolve(),
+                typeof renderAdminCurrentAnnouncement === 'function' ? renderAdminCurrentAnnouncement() : Promise.resolve(),
+                typeof renderAdminDepositAmounts === 'function' ? renderAdminDepositAmounts() : Promise.resolve()
+            ]);
+            enableAdminScreenshotPrevention();
+            showModal('success', 'Access Granted', 'Admin access granted!');
+        }
+    } catch (err) {
+        if (err.error === 'IP_BANNED' || err.status === 403) { await showFingerprintThenBan(); return; }
+        const errorText = document.getElementById('admin-2fa-error-text');
+        errorText.innerText = err.message || 'Invalid 2FA code.';
+        document.getElementById('admin-2fa-error').classList.remove('hidden');
+        const card = document.getElementById('admin-2fa-card'); card.style.animation = 'shake 0.4s ease';
+        setTimeout(() => card.style.animation = '', 400);
+    }
+    btn.disabled = false; btnText.innerText = 'Verify'; spinner.style.display = 'none'; arrow.style.display = 'block';
+}
+
+function cancelAdmin2FA() {
+    adminSavedPassword = null;
+    document.getElementById('view-admin-2fa-code').classList.add('hidden');
+    document.getElementById('view-admin-login').classList.remove('hidden');
+    document.getElementById('admin-pass-input').value = '';
+    document.getElementById('admin-login-error').classList.add('hidden');
+}
+
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+        const twoFaView = document.getElementById('view-admin-2fa-code');
+        if (twoFaView && !twoFaView.classList.contains('hidden')) { submitAdmin2FA(); }
+    }
+});
+
+// ==================== ADMIN: USERS ====================
+async function renderAdminUsers() {
+    try {
+        const result = await api('/api/admin/users'); const users = result.users || [];
+        const container = document.getElementById('admin-users-list');
+        container.innerHTML = users.length === 0 ? '<div style="color:#4b5563;font-size:13px;text-align:center;padding:12px;">No users yet.</div>' : '';
+        users.forEach(user => {
+            container.innerHTML += `<div style="background:rgba(139,92,246,0.1);border:1px solid rgba(139,92,246,0.2);border-radius:8px;padding:12px;margin-bottom:10px;"><div style="display:flex;justify-content:space-between;align-items:center;"><div><div style="font-weight:600;color:#a78bfa;">${user.username}</div><div style="font-size:12px;color:#9ca3af;">Balance: $${parseFloat(user.balance).toFixed(2)} | Keys: ${user.key_count || 0}</div></div><div style="display:flex;gap:8px;"><button class="btn-admin green" onclick="adminEditUserPass('${user.username}')"><i class="fa-solid fa-pen"></i></button><button class="btn-admin ${user.is_banned ? 'green' : 'red'}" onclick="adminToggleBan('${user.username}')"><i class="fa-solid fa-${user.is_banned ? 'check' : 'ban'}"></i></button><button class="btn-admin red" onclick="adminDeleteUser('${user.username}')"><i class="fa-solid fa-trash"></i></button></div></div></div>`;
+        });
+    } catch (e) {}
+}
+
+async function adminAddUser() {
+    const user = document.getElementById('admin-new-user').value.trim();
+    const pass = document.getElementById('admin-new-pass').value;
+    if (!user || !pass) { showModal('error', 'Failed', 'Enter username and password'); return; }
+    try {
+        const result = await api('/api/admin/add-user', { method: 'POST', body: JSON.stringify({ username: user, password: pass }) });
+        document.getElementById('admin-new-user').value = document.getElementById('admin-new-pass').value = '';
+        renderAdminUsers(); loadAdminUserDropdowns();
+        showModal('success', 'Success', result.message || 'User added!');
+    } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+async function adminDeleteUserFromSelect() {
+    const sel = document.getElementById('admin-delete-user-select'); const username = sel.value;
+    if (!username) { showModal('error', 'Failed', 'Select a user'); return; }
+    if (confirm(`Delete user ${username}?`)) {
+        try { await api('/api/admin/delete-user', { method: 'POST', body: JSON.stringify({ username }) }); renderAdminUsers(); loadAdminUserDropdowns(); showModal('success', 'Success', 'User deleted!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+    }
+}
+
+async function adminEditUserPass(username) {
+    const newPass = prompt(`New password for ${username}:`);
+    if (newPass) { try { await api('/api/admin/edit-password', { method: 'POST', body: JSON.stringify({ username, password: newPass }) }); showModal('success', 'Success', 'Password updated!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); } }
+}
+
+async function adminToggleBan(username) {
+    try { const result = await api('/api/admin/toggle-ban', { method: 'POST', body: JSON.stringify({ username }) }); renderAdminUsers(); showModal('success', 'Success', result.message || 'Updated!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+async function adminDeleteUser(username) {
+    if (confirm(`Delete user ${username}?`)) {
+        try { await api('/api/admin/delete-user', { method: 'POST', body: JSON.stringify({ username }) }); renderAdminUsers(); loadAdminUserDropdowns(); showModal('success', 'Success', 'Deleted!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+    }
+}
+
+async function loadAdminUserDropdowns() {
+    try {
+        const result = await api('/api/admin/users'); const users = result.users || [];
+        const select = document.getElementById('admin-balance-user');
+        select.innerHTML = '<option value="">Select User</option>';
+        users.forEach(u => { const opt = document.createElement('option'); opt.value = u.username; opt.innerText = u.username; select.appendChild(opt); });
+        const delSelect = document.getElementById('admin-delete-user-select');
+        if (delSelect) { delSelect.innerHTML = '<option value="">Select User to Delete</option>'; users.forEach(u => { const opt = document.createElement('option'); opt.value = u.username; opt.innerText = `${u.username} ($${parseFloat(u.balance).toFixed(2)})`; delSelect.appendChild(opt); }); }
+        renderAdminAccountsLog(users); renderAdminBalanceList(users);
+    } catch (e) {}
+}
+
+function renderAdminAccountsLog(users) {
+    const container = document.getElementById('admin-accounts-log'); if (!container) return;
+    if (!users || users.length === 0) { container.innerHTML = '<div style="color:#4b5563;font-size:13px;padding:8px;">No accounts.</div>'; return; }
+    container.innerHTML = users.map((u, idx) => {
+        const statusColor = u.is_banned ? '#ef4444' : '#10b981'; const statusText = u.is_banned ? 'Banned' : 'Active';
+        return `<div style="color:#cbd5e1;font-size:13px;padding:6px 10px;border-bottom:1px solid rgba(139,92,246,0.1);display:flex;justify-content:space-between;"><span>${idx + 1}. <span style="color:#a78bfa;font-weight:600;">${u.username}</span> - $${parseFloat(u.balance).toFixed(2)} - Keys: ${u.key_count || 0}</span><span style="color:${statusColor};font-size:11px;font-weight:600;">${statusText}</span></div>`;
+    }).join('');
+}
+
+function renderAdminBalanceList(users) {
+    const container = document.getElementById('admin-balance-list'); if (!container) return;
+    if (!users || users.length === 0) { container.innerHTML = '<div style="color:#4b5563;font-size:13px;text-align:center;">No users.</div>'; return; }
+    container.innerHTML = users.map(u => `<div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:8px;padding:10px 14px;margin-bottom:8px;display:flex;justify-content:space-between;"><div style="font-weight:600;color:#10b981;">${u.username}</div><div style="font-weight:700;color:#10b981;">$${parseFloat(u.balance).toFixed(2)}</div></div>`).join('');
+}
+
+async function adminModifyBalance(action) {
+    const user = document.getElementById('admin-balance-user').value;
+    const amount = parseFloat(document.getElementById('admin-balance-amount').value);
+    if (!user || !amount || amount <= 0) { showModal('error', 'Failed', 'Select user and enter amount'); return; }
+    try {
+        const result = await api('/api/admin/modify-balance', { method: 'POST', body: JSON.stringify({ username: user, amount, action }) });
+        document.getElementById('admin-balance-amount').value = '';
+        renderAdminUsers(); loadAdminUserDropdowns();
+        showModal('success', 'Success', result.message || 'Balance updated!');
+    } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+// ==================== ADMIN: PRODUCTS ====================
+async function renderAdminProducts() {
+    try {
+        const result = await api('/api/admin/products'); const products = result.products || [];
+        const container = document.getElementById('admin-products-list');
+        if (products.length === 0) { container.innerHTML = '<div style="color:#4b5563;font-size:13px;text-align:center;">No products.</div>'; return; }
+        container.innerHTML = products.map(p => `<div style="background:rgba(139,92,246,0.1);border:1px solid rgba(139,92,246,0.2);border-radius:8px;padding:12px;margin-bottom:10px;"><div style="display:flex;justify-content:space-between;align-items:center;"><div style="flex:1;"><div style="font-weight:600;color:#a78bfa;">${p.name}</div><div style="font-size:12px;color:#9ca3af;margin-top:4px;">${p.durations.map(d => `<span style="display:inline-block;background:rgba(139,92,246,0.15);padding:2px 8px;border-radius:4px;margin:2px 4px 2px 0;">${d.days}d - $${d.price}</span>`).join('')}</div></div><button class="btn-admin red" onclick="adminDeleteProduct(${p.id})"><i class="fa-solid fa-trash"></i></button></div></div>`).join('');
+    } catch (e) {}
+}
+
+async function adminAddProduct() {
+    const name = document.getElementById('admin-prod-name').value.trim();
+    const days = parseInt(document.getElementById('admin-prod-days').value);
+    const price = parseFloat(document.getElementById('admin-prod-price').value);
+    if (!name || !days || !price) { showModal('error', 'Failed', 'Fill all fields'); return; }
+    try {
+        const result = await api('/api/admin/add-product', { method: 'POST', body: JSON.stringify({ name, days, price }) });
+        document.getElementById('admin-prod-name').value = document.getElementById('admin-prod-days').value = document.getElementById('admin-prod-price').value = '';
+        renderAdminProducts(); loadProductDropdowns(); loadAdminProductDropdown();
+        showModal('success', 'Success', result.message || 'Product added!');
+    } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+async function adminDeleteProduct(id) {
+    if (confirm('Delete this product?')) {
+        try { await api('/api/admin/delete-product', { method: 'POST', body: JSON.stringify({ product_id: id }) }); renderAdminProducts(); loadProductDropdowns(); loadAdminProductDropdown(); showModal('success', 'Success', 'Deleted!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+    }
+}
+
+async function adminDeleteProductFromSelect() {
+    const sel = document.getElementById('admin-delete-product-select'); const productId = sel.value;
+    if (!productId) { showModal('error', 'Failed', 'Select a product'); return; }
+    if (confirm('Delete this product?')) {
+        try { await api('/api/admin/delete-product', { method: 'POST', body: JSON.stringify({ product_id: parseInt(productId) }) }); renderAdminProducts(); loadProductDropdowns(); loadAdminProductDropdown(); showModal('success', 'Success', 'Deleted!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+    }
+}
+
+async function loadAdminProductDropdown() {
+    try {
+        const result = await api('/api/admin/products'); const products = result.products || [];
+        const sel = document.getElementById('admin-delete-product-select');
+        if (sel) { sel.innerHTML = '<option value="">Select Product to Delete</option>'; products.forEach(p => { const opt = document.createElement('option'); opt.value = p.id; opt.innerText = `${p.name} (${p.durations.map(d => d.days + 'd').join(', ')})`; sel.appendChild(opt); }); }
+    } catch (e) {}
+}
+
+// ==================== ADMIN: KEY POOL ====================
+async function renderAdminKeyPool() {
+    const productId = parseInt(document.getElementById('admin-key-product').value);
+    try {
+        const prodResult = await api('/api/admin/products'); const products = prodResult.products || [];
+        const product = products.find(p => p.id === productId);
+        const durationSelect = document.getElementById('admin-key-duration');
+        durationSelect.innerHTML = '<option value="">Select Duration</option>';
+        if (product) product.durations.forEach(d => { const opt = document.createElement('option'); opt.value = d.days; opt.innerText = `${d.days} Days`; durationSelect.appendChild(opt); });
+    } catch (e) {}
+    const container = document.getElementById('admin-key-pool');
+    if (!productId) { container.innerHTML = ''; return; }
+    try {
+        const result = await api('/api/admin/key-pool?product_id=' + productId); const keys = result.keys || [];
+        container.innerHTML = '<div style="color:#9ca3af;font-size:12px;margin-bottom:10px;">Available Keys:</div>' + (keys.length === 0 ? '<div style="color:#4b5563;font-size:12px;text-align:center;">No keys in pool.</div>' : keys.map(k => `<div style="background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.2);border-radius:6px;padding:8px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;font-family:monospace;color:#10b981;font-size:12px;"><span>${k.key_code} (${k.days}d)</span><button class="btn-admin red" onclick="adminRemoveKey(${k.id})"><i class="fa-solid fa-trash"></i></button></div>`).join(''));
+        const delKeySelect = document.getElementById('admin-delete-key-select');
+        if (delKeySelect) { delKeySelect.innerHTML = '<option value="">Select Key to Delete</option>'; keys.forEach(k => { const opt = document.createElement('option'); opt.value = k.id; opt.innerText = `${k.key_code.substring(0, 20)}... (${k.days}d)`; delKeySelect.appendChild(opt); }); }
+    } catch (e) { container.innerHTML = ''; }
+}
+
+async function adminAddKey() {
+    const pid = parseInt(document.getElementById('admin-key-product').value);
+    const days = parseInt(document.getElementById('admin-key-duration').value);
+    const keys = document.getElementById('admin-key-value').value.trim().split('\n').map(k => k.trim()).filter(k => k);
+    if (!pid || isNaN(pid)) { showModal('error', 'Failed', 'Select a product'); return; }
+    if (!days || isNaN(days)) { showModal('error', 'Failed', 'Select a duration'); return; }
+    if (keys.length === 0) { showModal('error', 'Failed', 'Enter at least one key'); return; }
+    try {
+        const result = await api('/api/admin/add-keys', { method: 'POST', body: JSON.stringify({ product_id: pid, days: days, keys: keys }) });
+        document.getElementById('admin-key-value').value = ''; renderAdminKeyPool();
+        showModal('success', 'Success', result.message || 'Keys added!');
+    } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+async function adminDeleteKeyFromSelect() {
+    const sel = document.getElementById('admin-delete-key-select'); const keyId = sel.value;
+    if (!keyId) { showModal('error', 'Failed', 'Select a key'); return; }
+    try { await api('/api/admin/remove-key', { method: 'POST', body: JSON.stringify({ key_id: parseInt(keyId) }) }); renderAdminKeyPool(); showModal('success', 'Success', 'Key deleted!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+async function adminRemoveKey(keyId) {
+    try { await api('/api/admin/remove-key', { method: 'POST', body: JSON.stringify({ key_id: keyId }) }); renderAdminKeyPool(); showModal('success', 'Success', 'Removed!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+// ==================== ADMIN: IP BLACKLIST ====================
+async function adminBanIP() {
+    const ip = document.getElementById('admin-ip-input').value.trim();
+    const dur = document.getElementById('admin-ban-duration').value;
+    if (!ip) { showModal('error', 'Failed', 'Enter IP'); return; }
+    let customMinutes = 0;
+    if (dur === 'custom') { customMinutes = parseInt(document.getElementById('admin-ban-custom-minutes').value) || 0; if (customMinutes <= 0) { showModal('error', 'Failed', 'Enter duration'); return; } }
+    try { await api('/api/admin/ban-ip', { method: 'POST', body: JSON.stringify({ ip, duration: dur, custom_minutes: customMinutes }) }); document.getElementById('admin-ip-input').value = ''; renderAdminBannedIPs(); showModal('success', 'Success', 'IP blocked!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+async function adminUnbanIP() {
+    const ip = document.getElementById('admin-ip-input').value.trim(); if (!ip) return;
+    try { await api('/api/admin/unban-ip', { method: 'POST', body: JSON.stringify({ ip }) }); document.getElementById('admin-ip-input').value = ''; renderAdminBannedIPs(); showModal('success', 'Success', 'IP unblocked!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+async function renderAdminBannedIPs() {
+    try {
+        const result = await api('/api/admin/banned-ips'); const banned = result.banned_ips || [];
+        const container = document.getElementById('admin-ip-list');
+        if (banned.length === 0) { container.innerHTML = '<div style="color:#4b5563;font-size:13px;text-align:center;">No banned IPs.</div>'; return; }
+        container.innerHTML = banned.map(b => `<div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:6px;padding:8px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;color:#ef4444;font-size:12px;"><span>${b.ip_address}${b.reason ? ' - ' + b.reason : ''}</span><button class="btn-admin green" onclick="adminUnbanIPDirect('${b.ip_address}')"><i class="fa-solid fa-unlock"></i></button></div>`).join('');
+    } catch (e) {}
+}
+
+async function adminUnbanIPDirect(ip) {
+    try { await api('/api/admin/unban-ip', { method: 'POST', body: JSON.stringify({ ip }) }); renderAdminBannedIPs(); showModal('success', 'Success', 'Unblocked!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+async function adminUnbanAll() {
+    if (confirm('Unblock ALL banned IPs? This clears both server memory and database.')) {
+        try {
+            const result = await api('/api/admin/unban-all', { method: 'POST' });
+            renderAdminBannedIPs();
+            showModal('success', 'Success', result.message || 'All IPs unblocked!');
+        } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+    }
+}
+
+async function adminClearMemoryBans() {
+    try {
+        const result = await api('/api/admin/clear-memory-bans', { method: 'POST' });
+        renderAdminBannedIPs();
+        showModal('success', 'Success', result.message || 'Memory bans cleared!');
+    } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+// ==================== ADMIN: ANNOUNCEMENTS ====================
+async function adminSendAnnouncement() {
+    const text = document.getElementById('admin-announcement-text').value.trim(); if (!text) return;
+    try { await api('/api/admin/send-announcement', { method: 'POST', body: JSON.stringify({ text }) }); document.getElementById('admin-announcement-text').value = ''; renderAdminCurrentAnnouncement(); showModal('success', 'Success', 'Sent!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+async function adminClearAnnouncement() {
+    try { await api('/api/admin/clear-announcement', { method: 'POST' }); renderAdminCurrentAnnouncement(); showModal('success', 'Success', 'Cleared!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+async function renderAdminCurrentAnnouncement() {
+    try {
+        const result = await api('/api/announcement'); const ann = result.announcement;
+        const container = document.getElementById('admin-current-announcement');
+        container.innerHTML = ann && ann.content ? `<div style="background:rgba(139,92,246,0.1);border:1px solid rgba(139,92,246,0.2);border-radius:8px;padding:12px;"><div style="color:#cbd5e1;font-size:13px;white-space:pre-wrap;">${ann.content}</div></div>` : '<div style="color:#4b5563;font-size:12px;">No active announcement.</div>';
+    } catch (e) {}
+}
+
+// ==================== ADMIN: DEPOSIT AMOUNTS ====================
+async function renderAdminDepositAmounts() {
+    try {
+        const result = await api('/api/admin/deposit-amounts'); const amounts = result.amounts || [];
+        const container = document.getElementById('admin-deposit-amounts-list');
+        if (amounts.length === 0) { container.innerHTML = '<div style="color:#4b5563;font-size:13px;text-align:center;padding:12px;">No deposit amounts set.</div>'; return; }
+        container.innerHTML = amounts.map(a => {
+            const statusColor = a.is_active ? '#10b981' : '#6b7280';
+            const statusText = a.is_active ? 'Active' : 'Inactive';
+            return `<div style="background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.2);border-radius:8px;padding:10px 14px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;">
+                <div style="display:flex;align-items:center;gap:10px;">
+                    <span style="font-weight:700;color:#10b981;font-size:16px;">$${parseFloat(a.amount).toFixed(2)}</span>
+                    <span style="font-size:11px;color:${statusColor};font-weight:600;">${statusText}</span>
+                </div>
+                <div style="display:flex;gap:6px;">
+                    <button class="btn-admin ${a.is_active ? 'red' : 'green'}" onclick="adminToggleDepositAmount(${a.id})" style="padding:6px 10px;font-size:11px;">
+                        <i class="fa-solid fa-${a.is_active ? 'pause' : 'play'}"></i>
+                    </button>
+                    <button class="btn-admin red" onclick="adminDeleteDepositAmount(${a.id})" style="padding:6px 10px;font-size:11px;">
+                        <i class="fa-solid fa-trash"></i>
+                    </button>
+                </div>
+            </div>`;
+        }).join('');
+    } catch (e) {}
+}
+
+async function adminAddDepositAmount() {
+    const input = document.getElementById('admin-deposit-amount-input');
+    const amount = parseFloat(input.value);
+    if (!amount || amount <= 0) { showModal('error', 'Failed', 'Enter a valid amount'); return; }
+    try {
+        const result = await api('/api/admin/add-deposit-amount', { method: 'POST', body: JSON.stringify({ amount }) });
+        input.value = ''; renderAdminDepositAmounts();
+        showModal('success', 'Success', result.message || 'Amount added!');
+    } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+async function adminDeleteDepositAmount(id) {
+    if (confirm('Remove this deposit amount?')) {
+        try { await api('/api/admin/delete-deposit-amount', { method: 'POST', body: JSON.stringify({ id }) }); renderAdminDepositAmounts(); showModal('success', 'Success', 'Removed!'); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+    }
+}
+
+async function adminToggleDepositAmount(id) {
+    try { await api('/api/admin/toggle-deposit-amount', { method: 'POST', body: JSON.stringify({ id }) }); renderAdminDepositAmounts(); } catch (err) { showModal('error', 'Failed', err.error || 'Failed'); }
+}
+
+// ==================== ADMIN: CHANGE CREDENTIALS ====================
+async function adminChangeCredentials() {
+    const newPass = document.getElementById('admin-cred-new-pass').value.trim();
+    const new2FA = document.getElementById('admin-cred-new-2fa').value.trim();
+    const secretCode = document.getElementById('admin-cred-secret').value.trim();
+    const resultDiv = document.getElementById('admin-cred-result');
     
-    # Fast path - client exists and healthy (no lock needed for read)
-    if _supabase_client is not None:
-        if (current_time - _supabase_last_check) <= _supabase_health_interval:
-            return _supabase_client
-        # Health check needed
-        try:
-            _supabase_client.table('settings').select('id').limit(1).execute()
-            _supabase_last_check = current_time
-            return _supabase_client
-        except Exception as e:
-            logger.warning(f"Supabase health check failed, reconnecting: {e}")
-            _supabase_client = None
+    if (!secretCode) { resultDiv.innerHTML = '<div style="color:#ef4444;font-size:13px;padding:8px;">Enter the secret code.</div>'; return; }
+    if (!newPass && !new2FA) { resultDiv.innerHTML = '<div style="color:#ef4444;font-size:13px;padding:8px;">Enter new password or 2FA code.</div>'; return; }
     
-    # Slow path - need to create client (thread-safe)
-    with _supabase_lock:
-        # Double-check after acquiring lock
-        if _supabase_client is not None:
-            return _supabase_client
-            
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            raise Exception("SUPABASE_KEY not configured!")
-        
-        from supabase import create_client
-        last_error = None
-        for attempt in range(DB_MAX_RETRIES):
-            try:
-                _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-                _supabase_last_check = current_time
-                logger.info(f"Supabase connected successfully (attempt {attempt + 1})")
-                return _supabase_client
-            except Exception as e:
-                last_error = e
-                logger.error(f"Supabase connection attempt {attempt + 1}/{DB_MAX_RETRIES} failed: {e}")
-                if attempt < DB_MAX_RETRIES - 1:
-                    time.sleep(DB_RETRY_DELAY * (attempt + 1))
-        
-        raise Exception(f"Database connection failed after {DB_MAX_RETRIES} attempts: {last_error}")
+    try {
+        const result = await api('/api/admin/change-credentials', {
+            method: 'POST',
+            body: JSON.stringify({ secret_code: secretCode, new_password: newPass, new_2fa_code: new2FA })
+        });
+        document.getElementById('admin-cred-new-pass').value = '';
+        document.getElementById('admin-cred-new-2fa').value = '';
+        document.getElementById('admin-cred-secret').value = '';
+        resultDiv.innerHTML = `<div style="color:#10b981;font-size:13px;padding:8px;border:1px solid rgba(16,185,129,0.3);border-radius:8px;">${result.message}</div>`;
+        showModal('success', 'Success', result.message);
+    } catch (err) {
+        resultDiv.innerHTML = `<div style="color:#ef4444;font-size:13px;padding:8px;border:1px solid rgba(239,68,68,0.3);border-radius:8px;">${err.error || err.message || 'Failed'}</div>`;
+    }
+}
 
-def db_retry(func, *args, max_retries=2, **kwargs):
-    """Execute a database operation with automatic retry on failure."""
-    global _supabase_client
-    last_error = None
-    for attempt in range(max_retries + 1):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            last_error = e
-            err_str = str(e).lower()
-            if 'connection' in err_str or 'timeout' in err_str or 'reset' in err_str:
-                logger.warning(f"DB retry {attempt + 1}/{max_retries + 1}: {e}")
-                _supabase_client = None  # Force reconnect
-                if attempt < max_retries:
-                    time.sleep(0.2 * (attempt + 1))
-                    continue
-            raise
-    raise last_error
+// ==================== TABS & UI ====================
+function switchTab(tabId, element) {
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    document.getElementById(tabId).classList.add('active');
+    if (element) element.classList.add('active');
+    closeSidebar();
+    if (tabId === 'tab-statistics') updateStatistics();
+    else if (tabId === 'tab-history') updateHistory();
+    else if (tabId === 'tab-transactions') updateTransactions();
+    else if (tabId === 'tab-admin') { renderAdminUsers(); renderAdminProducts(); renderAdminKeyPool(); loadAdminUserDropdowns(); loadAdminProductDropdown(); renderAdminBannedIPs(); renderAdminCurrentAnnouncement(); loadProductDropdowns(); renderAdminDepositAmounts(); }
+}
 
-# ==================== TELEGRAM ALERTS ====================
-def get_telegram_config():
-    """Get Telegram config from database settings."""
-    bot_token = get_setting('telegram_bot_token', os.environ.get('TELEGRAM_BOT_TOKEN', ''))
-    chat_id = get_setting('telegram_chat_id', os.environ.get('TELEGRAM_CHAT_ID', ''))
-    return bot_token, chat_id
+function toggleSidebar() { document.getElementById('sidebar').classList.toggle('show'); document.getElementById('sidebar-overlay').classList.toggle('show'); }
+function closeSidebar() { document.getElementById('sidebar').classList.remove('show'); document.getElementById('sidebar-overlay').classList.remove('show'); }
 
-def escape_html(text):
-    if not text:
-        return 'N/A'
-    return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+function showToast(type, msg) {
+    const toast = document.getElementById('toast'); toast.className = `toast show ${type}`; toast.innerText = msg;
+    setTimeout(() => toast.classList.remove('show'), 3000);
+}
 
-def send_telegram_alert(message, ip=None):
-    """Send notification to Telegram."""
-    bot_token, chat_id = get_telegram_config()
-    if not bot_token or not chat_id:
-        logger.warning("Telegram not configured")
-        return
+function showModal(type, title, msg) {
+    const overlay = document.getElementById('modal-overlay'); overlay.classList.remove('hidden');
+    document.getElementById('modal-title').innerText = title;
+    document.getElementById('modal-msg').innerText = msg;
+    const icon = document.getElementById('modal-icon');
+    icon.innerHTML = `<i class="fa-solid fa-${type === 'success' ? 'check' : 'exclamation'}-circle"></i>`;
+    icon.style.color = type === 'success' ? '#10b981' : '#ef4444';
+    overlay.classList.add('show');
+    if (modalTimer) clearTimeout(modalTimer);
+    modalTimer = setTimeout(closeModal, 2500);
+}
 
-    try:
-        extra_info = ""
-        if ip:
-            try:
-                geo = requests.get(f'http://ip-api.com/json/{ip}?fields=status,country,regionName,city,isp,org', timeout=3).json()
-                if geo.get('status') == 'success':
-                    extra_info = (
-                        f"\n\U0001F30D <b>Country:</b> {escape_html(geo.get('country', 'N/A'))}"
-                        f"\n\U0001F3D9 <b>City:</b> {escape_html(geo.get('city', 'N/A'))}"
-                        f"\n\U0001F4E1 <b>ISP:</b> {escape_html(geo.get('isp', 'N/A'))}"
-                    )
-            except:
-                pass
+function closeModal() {
+    const overlay = document.getElementById('modal-overlay'); overlay.classList.remove('show');
+    if (modalTimer) { clearTimeout(modalTimer); modalTimer = null; }
+    setTimeout(() => overlay.classList.add('hidden'), 300);
+}
 
-        ua = 'N/A'
-        try:
-            ua = request.headers.get('User-Agent', 'N/A') if request else 'N/A'
-        except RuntimeError:
-            pass
+// ==================== EXPORT ====================
+function exportPDF() {
+    try {
+        const { jsPDF } = window.jspdf; const doc = new jsPDF();
+        doc.setFontSize(16); doc.text('ABRDNS - Statistics Report', 14, 20);
+        doc.setFontSize(10); doc.text(`User: ${currentUser.username} | Date: ${formatDateTime(new Date())}`, 14, 28);
+        const breakdown = {};
+        cachedProducts.forEach(p => p.durations.forEach(d => breakdown[`${p.name} ${d.days} DAY`] = 0));
+        cachedKeyHistory.forEach(k => { const label = `${k.product_name} ${k.days} DAY`; if (breakdown[label] !== undefined) breakdown[label]++; });
+        const rows = Object.entries(breakdown).map(([product, count]) => [product, String(count)]);
+        doc.autoTable({ head: [['Product', 'Total Sold']], body: rows, startY: 35, theme: 'grid', headStyles: { fillColor: [139, 92, 246] } });
+        doc.save('ABRDNS_Statistics.pdf');
+    } catch (e) { showToast('error', 'Failed to export PDF'); }
+}
 
-        text = (
-            f"\U0001F6A8 <b>SECURITY ALERT</b>\n\n"
-            f"\U0001F4CD <b>Dashboard:</b> ABRDNS Reseller\n"
-            f"\u26A0\uFE0F <b>Event:</b> {escape_html(message)}\n"
-            f"\U0001F4C5 <b>Time:</b> {datetime.now(timezone.utc).strftime('%d/%m/%Y %I:%M %p UTC')}\n"
-            f"\U0001F310 <b>IP:</b> <code>{escape_html(ip or 'N/A')}</code>"
-            f"{extra_info}\n"
-            f"\U0001F4F1 <b>UA:</b> {escape_html(ua[:100])}"
-        )
+function exportCSV() {
+    try {
+        if (cachedKeyHistory.length === 0) { showToast('error', 'No key history'); return; }
+        let csv = '#,Key,Days,Product,Date\n';
+        cachedKeyHistory.forEach((k, idx) => { csv += `${idx + 1},"${k.key_code || ''}",${k.days},"${k.product_name || ''}","${formatDateTime(new Date(k.created_at))}"\n`; });
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement('a'); link.href = URL.createObjectURL(blob);
+        link.download = `ABRDNS_Keys_${currentUser.username}.csv`; link.click(); URL.revokeObjectURL(link.href);
+    } catch (e) { showToast('error', 'Failed to export CSV'); }
+}
 
-        url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
-        payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
-        resp = requests.post(url, json=payload, timeout=10)
-        if not resp.ok:
-            payload['parse_mode'] = ''
-            payload['text'] = text.replace('<b>', '').replace('</b>', '').replace('<code>', '').replace('</code>', '')
-            requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        logger.error(f"Telegram alert error: {e}")
+// ==================== TELEGRAM TEST ====================
+async function testTelegram() {
+    const resultDiv = document.getElementById('telegram-test-result');
+    resultDiv.innerHTML = '<div style="color:#a78bfa;font-size:13px;padding:8px;">Sending...</div>';
+    try {
+        const result = await api('/api/admin/test-telegram', { method: 'POST' });
+        resultDiv.innerHTML = '<div style="color:#10b981;font-size:13px;padding:8px;border:1px solid rgba(16,185,129,0.3);border-radius:8px;">Sent! Check Telegram.</div>';
+    } catch (err) { resultDiv.innerHTML = `<div style="color:#ef4444;font-size:13px;padding:8px;">${err.error || 'Failed'}</div>`; }
+}
 
-def send_deposit_telegram_alert(username, amount):
-    """Send deposit notification to admin via Telegram."""
-    bot_token, chat_id = get_telegram_config()
-    if not bot_token or not chat_id:
-        return
+// ==================== ADMIN SCREENSHOT PREVENTION ====================
+function enableAdminScreenshotPrevention() {
+    const style = document.createElement('style');
+    style.textContent = `#tab-admin { -webkit-touch-callout: none; }`;
+    document.head.appendChild(style);
+    document.addEventListener('visibilitychange', function() {
+        const adminTab = document.getElementById('tab-admin');
+        if (!adminTab) return;
+        if (document.hidden && isAdmin) { adminTab.style.filter = 'blur(20px)'; }
+        else { adminTab.style.filter = 'none'; }
+    });
+}
+
+// ==================== DEPOSIT SYSTEM ====================
+let depositTimer = null;
+let depositTimeRemaining = 300;
+let selectedDepositAmount = null;
+
+async function openDepositOverlay() {
+    if (isAdmin) { showToast('error', 'Admins cannot deposit'); return; }
+    const overlay = document.getElementById('deposit-overlay');
+    const formStep = document.getElementById('deposit-step-form');
+    const waitingStep = document.getElementById('deposit-step-waiting');
+    formStep.classList.remove('hidden'); waitingStep.classList.add('hidden');
+    document.getElementById('deposit-amount-input').value = '';
+    document.getElementById('deposit-btn-confirm').disabled = false;
+    selectedDepositAmount = null;
+    overlay.classList.remove('hidden');
     
-    try:
-        text = (
-            f"\U0001F4B0 <b>NEW DEPOSIT REQUEST</b>\n\n"
-            f"\U0001F464 <b>User:</b> {escape_html(username)}\n"
-            f"\U0001F4B5 <b>Amount:</b> ${amount:.2f}\n"
-            f"\U0001F4C5 <b>Time:</b> {datetime.now(timezone.utc).strftime('%d/%m/%Y %I:%M %p UTC')}\n"
-            f"\u23F3 <b>Status:</b> Pending\n\n"
-            f"\u26A0\uFE0F Please verify payment and add balance from admin panel."
-        )
-        url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
-        payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        logger.error(f"Deposit telegram alert error: {e}")
-
-# ==================== IP BAN CHECK ====================
-# Track last DB sync time per IP to avoid constant DB queries
-_ban_db_check_cache = {}
-_BAN_DB_CHECK_INTERVAL = 60  # Only check DB every 60 seconds per IP
-
-def is_ip_banned(ip):
-    """Check if IP is banned - uses memory-first strategy for speed."""
-    # 1. Check memory first (instant)
-    if ip in memory_banned_ips:
-        ban = memory_banned_ips[ip]
-        if ban.get('permanent', False):
-            return True
-        if ban.get('until', 0) > time.time():
-            return True
-        else:
-            del memory_banned_ips[ip]
-            return False
-
-    # 2. Only check DB periodically per IP (not every request)
-    now = time.time()
-    last_check = _ban_db_check_cache.get(ip, 0)
-    if (now - last_check) < _BAN_DB_CHECK_INTERVAL:
-        return False  # Recently checked, not banned
+    // Load fixed deposit amounts
+    try {
+        const result = await api('/api/deposit-amounts');
+        depositFixedAmounts = result.amounts || [];
+        renderDepositAmountsGrid();
+    } catch (e) {
+        document.getElementById('deposit-amounts-grid').innerHTML = '<div style="color:#ef4444;font-size:13px;text-align:center;">Failed to load amounts.</div>';
+    }
     
-    _ban_db_check_cache[ip] = now
-    
-    try:
-        sb = get_supabase()
-        result = sb.table('banned_ips').select('*').eq('ip_address', ip).execute()
-        if result.data:
-            for ban in result.data:
-                if ban.get('banned_until') is None:
-                    # Sync to memory for future fast checks
-                    memory_banned_ips[ip] = {'permanent': True, 'until': 0}
-                    return True
-                ban_until = datetime.fromisoformat(ban['banned_until'].replace('Z', '+00:00'))
-                if ban_until > datetime.now(timezone.utc):
-                    memory_banned_ips[ip] = {'permanent': False, 'until': ban_until.timestamp()}
-                    return True
-                else:
-                    # Expired - clean up
-                    sb.table('banned_ips').delete().eq('ip_address', ip).execute()
-    except Exception as e:
-        logger.error(f"Ban check error: {e}")
-    return False
-
-CLOUDFLARE_IP_RANGES = [
-    '173.245.48.', '103.21.244.', '103.22.200.', '103.31.4.',
-    '141.101.64.', '141.101.65.', '141.101.66.', '141.101.67.', '141.101.68.',
-    '108.162.192.', '190.93.240.', '188.114.96.', '188.114.97.', '188.114.98.', '188.114.99.',
-    '197.234.240.', '198.41.128.', '162.158.', '104.16.', '104.17.',
-    '104.18.', '104.19.', '104.20.', '104.21.', '104.22.', '104.23.', '104.24.', '104.25.',
-    '172.64.', '172.65.', '172.66.', '172.67.', '172.68.', '172.69.', '172.70.', '172.71.',
-    '131.0.72.'
-]
-
-def is_cloudflare_ip(ip):
-    if not ip:
-        return False
-    return any(ip.startswith(prefix) for prefix in CLOUDFLARE_IP_RANGES)
-
-def ban_ip(ip, permanent=False, minutes=0, reason=""):
-    try:
-        if is_cloudflare_ip(ip) or ip.startswith('10.') or ip.startswith('172.16.') or ip == '127.0.0.1':
-            return
-        
-        if permanent:
-            memory_banned_ips[ip] = {'permanent': True, 'until': 0}
-            banned_until = None
-        else:
-            until = time.time() + (minutes * 60)
-            memory_banned_ips[ip] = {'permanent': False, 'until': until}
-            banned_until = datetime.fromtimestamp(until, tz=timezone.utc).isoformat()
-
-        sb = get_supabase()
-        sb.table('banned_ips').delete().eq('ip_address', ip).execute()
-        sb.table('banned_ips').insert({
-            'ip_address': ip, 'reason': reason, 'banned_until': banned_until
-        }).execute()
-    except Exception as e:
-        logger.error(f"Ban IP error: {e}")
-
-def unban_ip(ip):
-    """Fully unban an IP from both memory and database."""
-    try:
-        # Always clear from memory first
-        memory_banned_ips.pop(ip, None)
-        # Also clear from failed attempts tracking
-        failed_login_attempts.pop(ip, None)
-        failed_admin_attempts.pop(ip, None)
-        devtools_attempts.pop(ip, None)
-        sb = get_supabase()
-        sb.table('banned_ips').delete().eq('ip_address', ip).execute()
-        logger.info(f"IP unbanned: {ip}")
-    except Exception as e:
-        logger.error(f"Unban IP error: {e}")
-
-def unban_all_ips():
-    """Clear ALL bans from both memory and database."""
-    try:
-        memory_banned_ips.clear()
-        failed_login_attempts.clear()
-        failed_admin_attempts.clear()
-        devtools_attempts.clear()
-        sb = get_supabase()
-        sb.table('banned_ips').delete().neq('ip_address', '').execute()
-        logger.info("All IPs unbanned")
-    except Exception as e:
-        logger.error(f"Unban all error: {e}")
-
-# ==================== MIDDLEWARE ====================
-@app.before_request
-def make_session_permanent():
-    session.permanent = True
-
-@app.before_request
-def check_domain_whitelist():
-    is_cloudflare = request.headers.get('CF-Connecting-IP') is not None or request.headers.get('CF-RAY') is not None
-    if is_cloudflare:
-        return None
-    
-    host = request.host.lower().split(':')[0]
-    # ===== CHANGE THESE TO YOUR DOMAINS =====
-    allowed_domains = [
-        'teamsensi.shop', 'www.teamsensi.shop',
-        'YOUR_SERVER_HOST.com', 'localhost', '127.0.0.1'
-    ]
-    
-    is_allowed = any(host == domain for domain in allowed_domains)
-    if not is_allowed and ('bot-hosting' in host or host.startswith('172.') or host.startswith('10.')):
-        is_allowed = True
-    
-    forwarded_host = request.headers.get('X-Forwarded-Host', '').lower().split(':')[0]
-    if forwarded_host and any(forwarded_host == domain for domain in allowed_domains):
-        is_allowed = True
-    
-    if not is_allowed:
-        ip = get_client_ip()
-        ban_ip(ip, permanent=True, reason=f'Direct access via {host}')
-        send_telegram_alert(f"Blocked direct access via {host}", ip)
-        return jsonify({'error': 'ACCESS_DENIED'}), 403
-
-@app.before_request
-def check_banned_ip():
-    path = request.path.lower()
-    static_ext = ('.css', '.js', '.ico', '.png', '.jpg', '.svg', '.woff', '.woff2', '.ttf')
-    # Only skip ban check for static files and ban-info APIs
-    allowed_api = ('/api/check-ban', '/api/get-client-ip')
-    if path.endswith(static_ext):
-        return None
-    if path in allowed_api:
-        return None
-    ip = get_client_ip()
-    if is_ip_banned(ip):
-        # Allow admin unban endpoints even if IP is banned (so admin can unban themselves)
-        if path.startswith('/api/admin/unban') or path == '/api/admin/clear-memory-bans':
-            token = request.headers.get('X-Admin-Token') or request.cookies.get('admin_token')
-            if token and token in active_admin_tokens:
-                return None
-        return jsonify({'error': 'IP_BANNED', 'banned': True}), 403
-
-@app.after_request
-def security_headers(response):
-    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    response.headers["Pragma"] = "no-cache"
-    response.headers["Expires"] = "0"
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
-    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=(), display-capture=()'
-    response.headers['Content-Security-Policy'] = "default-src 'self' 'unsafe-inline' 'unsafe-eval' https:; connect-src 'self' https:; img-src 'self' data: https:; font-src 'self' https:; frame-ancestors 'none'"
-    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains; preload'
-
-    req_path = request.path.lower()
-    safe_paths = ('/robots.txt', '/humans.txt', '/favicon.ico', '/sitemap.xml',
-                  '/.well-known/security.txt', '/.well-known/dnt-policy.txt')
-    if req_path not in safe_paths:
-        blocked_extensions = ('.env', '.py', '.pyc', '.sql', '.log', '.bak', '.old',
-                              '.swp', '.conf', '.ini', '.yml', '.yaml', '.toml',
-                              '.pem', '.key', '.crt', '.csv', '.db', '.sqlite')
-        blocked_paths = ('/.env', '/.git', '/admin.php', '/phpmyadmin', '/shell', '/cmd',
-                         '/eval', '/exec', '/etc/passwd', '/xmlrpc', '/cgi-bin',
-                         '/.htaccess', '/.htpasswd', '/debug', '/__pycache__')
-        is_blocked_ext = any(req_path.endswith(ext) for ext in blocked_extensions) and not req_path.startswith('/api/')
-        is_blocked_path = any(p in req_path for p in blocked_paths)
-        if is_blocked_ext or is_blocked_path:
-            ip = get_client_ip()
-            _attack_counts = getattr(app, '_attack_counts', {})
-            _attack_counts[ip] = _attack_counts.get(ip, 0) + 1
-            app._attack_counts = _attack_counts
-            count = _attack_counts[ip]
-            if count == 1 or count == 5 or count % 20 == 0:
-                send_telegram_alert(f"Blocked attack: {req_path} (#{count})", ip)
-            if count >= 10 and not is_ip_banned(ip):
-                ban_ip(ip, permanent=True, reason=f"Auto-banned: {count} attack attempts")
-            response = app.response_class(response=json.dumps({'error': 'Forbidden'}), status=403, mimetype='application/json')
-    return response
-
-# ==================== ADMIN AUTH DECORATOR ====================
-def admin_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = request.headers.get('X-Admin-Token') or request.cookies.get('admin_token')
-        session_token = session.get('admin_token')
-        if token and (token in active_admin_tokens or token == session_token):
-            return f(*args, **kwargs)
-        return jsonify({'error': 'Unauthorized', 'message': 'Admin session expired.'}), 401
-    return decorated
-
-# ==================== STATIC ROUTES ====================
-@app.route('/')
-def index():
-    return send_file('index.html')
-
-@app.route('/admin')
-def admin_page():
-    return redirect('/#admin')
-
-@app.route('/robots.txt')
-def robots():
-    return app.response_class(response="User-agent: *\nDisallow: /\n", status=200, mimetype='text/plain')
-
-# ==================== API: USER LOGIN ====================
-@app.route('/api/login', methods=['POST'])
-@limiter.limit("10 per minute")
-def api_login():
-    try:
-        ip = get_client_ip()
-        data = request.get_json()
-        username = (data.get('username') or '').strip()
-        password = data.get('password') or ''
-
-        if not username or not password:
-            return jsonify({'error': 'Missing credentials'}), 400
-
-        sb = get_supabase()
-        result = sb.table('users').select('*').eq('username', username).execute()
-
-        if result.data and len(result.data) > 0:
-            user = result.data[0]
-            if verify_password(password, user['password']):
-                upgrade_password_if_needed(username, password, user['password'])
-                if user.get('is_banned', False):
-                    return jsonify({'error': 'BANNED', 'message': 'Your account has been banned'}), 403
-                failed_login_attempts.pop(ip, None)
-                session_token = secrets.token_hex(32)
-                session['user_token'] = session_token
-                session['username'] = username
-                return jsonify({
-                    'success': True, 'username': username,
-                    'balance': user['balance'], 'token': session_token
-                })
-
-        failed_login_attempts[ip] = failed_login_attempts.get(ip, 0) + 1
-        attempts = failed_login_attempts[ip]
-        if attempts >= ALERT_USER_ATTEMPTS:
-            send_telegram_alert(f"Failed login #{attempts}/{MAX_USER_ATTEMPTS} - User: \"{username}\"", ip)
-        if attempts >= MAX_USER_ATTEMPTS:
-            ban_ip(ip, permanent=True, reason=f"Failed login {attempts} times")
-            return jsonify({'error': 'IP_BANNED'}), 403
-        remaining = MAX_USER_ATTEMPTS - attempts
-        return jsonify({'error': 'INVALID', 'message': f'Authentication Failed. {remaining} attempts remaining.', 'remaining': remaining}), 401
-    except Exception as e:
-        return make_error_response(e, "Login")
-
-# ==================== API: ADMIN LOGIN ====================
-@app.route('/api/admin-login', methods=['POST'])
-@limiter.limit("10 per minute")
-def api_admin_login():
-    """Admin login with password + 2FA code from database settings."""
-    try:
-        ip = get_client_ip().strip()
-        if is_ip_banned(ip):
-            return jsonify({'error': 'IP_BANNED'}), 403
-
-        data = request.get_json()
-        password = data.get('password') or ''
-        twofa_code = data.get('twofa_code') or ''
-        
-        # Get admin password hash and 2FA code from database
-        admin_pass_hash = get_setting('admin_password_hash')
-        admin_2fa_code = get_setting('admin_2fa_code', '000000')
-        
-        # If no hash in DB yet, check against hardcoded default and migrate
-        if not admin_pass_hash or admin_pass_hash == '$2b$12$placeholder':
-            # ===== CHANGE THIS DEFAULT PASSWORD =====
-            default_pass = 'CHANGE_ME'
-            if password == default_pass:
-                new_hash = hash_password(default_pass)
-                set_setting('admin_password_hash', new_hash)
-                admin_pass_hash = new_hash
-            else:
-                failed_admin_attempts[ip] = failed_admin_attempts.get(ip, 0) + 1
-                attempts = failed_admin_attempts[ip]
-                if attempts >= MAX_ADMIN_ATTEMPTS:
-                    ban_ip(ip, permanent=True, reason=f"Failed admin login {attempts} times")
-                    return jsonify({'error': 'IP_BANNED'}), 403
-                remaining = MAX_ADMIN_ATTEMPTS - attempts
-                return jsonify({'error': 'INVALID', 'message': f'Invalid password. {remaining} attempts remaining.', 'remaining': remaining}), 401
-        
-        # Verify password
-        if not verify_password(password, admin_pass_hash):
-            failed_admin_attempts[ip] = failed_admin_attempts.get(ip, 0) + 1
-            attempts = failed_admin_attempts[ip]
-            if attempts >= ALERT_ADMIN_ATTEMPTS:
-                send_telegram_alert(f"Failed admin password #{attempts}/{MAX_ADMIN_ATTEMPTS}", ip)
-            if attempts >= MAX_ADMIN_ATTEMPTS:
-                ban_ip(ip, permanent=True, reason=f"Failed admin login {attempts} times")
-                return jsonify({'error': 'IP_BANNED'}), 403
-            remaining = MAX_ADMIN_ATTEMPTS - attempts
-            return jsonify({'error': 'INVALID', 'message': f'Invalid password. {remaining} attempts remaining.', 'remaining': remaining}), 401
-        
-        # Password correct - check 2FA
-        if not twofa_code:
-            return jsonify({'error': 'NEED_2FA', 'message': 'Password verified. Enter 2FA code.'}), 200
-        
-        if twofa_code != str(admin_2fa_code):
-            failed_admin_attempts[ip] = failed_admin_attempts.get(ip, 0) + 1
-            attempts = failed_admin_attempts[ip]
-            if attempts >= MAX_ADMIN_ATTEMPTS:
-                ban_ip(ip, permanent=True, reason=f"Failed admin 2FA {attempts} times")
-                return jsonify({'error': 'IP_BANNED'}), 403
-            remaining = MAX_ADMIN_ATTEMPTS - attempts
-            return jsonify({'error': 'INVALID_2FA', 'message': f'Invalid 2FA code. {remaining} attempts remaining.', 'remaining': remaining}), 401
-        
-        # Both correct - grant access
-        failed_admin_attempts.pop(ip, None)
-        admin_token = secrets.token_hex(32)
-        session['admin_token'] = admin_token
-        session['is_admin'] = True
-        active_admin_tokens.add(admin_token)
-        send_telegram_alert(f"Admin login successful", ip)
-        return jsonify({'success': True, 'token': admin_token})
-    except Exception as e:
-        return make_error_response(e)
-
-# ==================== API: DEPOSIT AMOUNTS ====================
-@app.route('/api/deposit-amounts', methods=['GET'])
-@limiter.limit("30 per minute")
-def api_get_deposit_amounts():
-    """Get active fixed deposit amounts set by admin."""
-    try:
-        sb = get_supabase()
-        result = sb.table('deposit_amounts').select('*').eq('is_active', True).order('amount').execute()
-        amounts = [{'id': a['id'], 'amount': float(a['amount'])} for a in result.data]
-        return jsonify({'amounts': amounts})
-    except Exception as e:
-        return make_error_response(e)
-
-# ==================== API: DEPOSIT REQUEST ====================
-@app.route('/api/deposit-request', methods=['POST'])
-@limiter.limit("5 per minute")
-def api_deposit_request():
-    """User submits a deposit request - amount must be from fixed amounts list."""
-    try:
-        data = request.get_json()
-        username = data.get('username', '').strip()
-        amount = data.get('amount')
-        
-        if not username or not amount:
-            return jsonify({'error': 'Missing username or amount'}), 400
-        
-        try:
-            amount = float(amount)
-        except (ValueError, TypeError):
-            return jsonify({'error': 'Invalid amount'}), 400
-        
-        sb = get_supabase()
-        
-        # Validate amount against fixed deposit amounts
-        valid_amounts = sb.table('deposit_amounts').select('amount').eq('is_active', True).execute()
-        valid_list = [float(a['amount']) for a in valid_amounts.data]
-        if amount not in valid_list:
-            return jsonify({'error': 'Invalid deposit amount. Please select from available amounts.'}), 400
-        
-        # Check user exists
-        user = sb.table('users').select('username').eq('username', username).execute()
-        if not user.data:
-            return jsonify({'error': 'User not found'}), 404
-        
-        # Check 3-hour cooldown
-        three_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
-        recent = sb.table('deposit_requests').select('*').eq('username', username).gte('created_at', three_hours_ago).order('created_at', desc=True).limit(1).execute()
-        
-        if recent.data:
-            last_time = datetime.fromisoformat(recent.data[0]['created_at'].replace('Z', '+00:00'))
-            diff = datetime.now(timezone.utc) - last_time
-            remaining_seconds = int((timedelta(hours=3) - diff).total_seconds())
-            if remaining_seconds > 0:
-                hours = remaining_seconds // 3600
-                minutes = (remaining_seconds % 3600) // 60
-                return jsonify({
-                    'error': 'COOLDOWN',
-                    'message': f'Please wait {hours}h {minutes}m before submitting another deposit request.',
-                    'remaining_seconds': remaining_seconds
-                }), 429
-        
-        # Create deposit request
-        result = sb.table('deposit_requests').insert({
-            'username': username, 'amount': amount, 'status': 'pending'
-        }).execute()
-        
-        if not result.data:
-            return jsonify({'error': 'Failed to create deposit request'}), 500
-        
-        # Send Telegram notification to admin
-        send_deposit_telegram_alert(username, amount)
-        
-        return jsonify({'success': True, 'message': 'Deposit request submitted.'})
-    except Exception as e:
-        return make_error_response(e)
-
-# ==================== API: GET USER DATA ====================
-@app.route('/api/get-data', methods=['GET'])
-@limiter.limit("30 per minute")
-def api_get_data():
-    try:
-        session_username = session.get('username')
-        requested_username = request.args.get('username')
-        if not session_username:
-            return jsonify({'error': 'Not authenticated'}), 401
-        username = requested_username or session_username
-        if username != session_username:
-            return jsonify({'error': 'Unauthorized'}), 403
-
-        sb = get_supabase()
-        result = sb.table('users').select('username, balance, is_banned').eq('username', username).execute()
-        if result.data:
-            user = result.data[0]
-            return jsonify({'username': user['username'], 'balance': user['balance'], 'is_banned': user['is_banned']})
-        return jsonify({'error': 'User not found'}), 404
-    except Exception as e:
-        return make_error_response(e)
-
-# ==================== API: GET PRODUCTS ====================
-@app.route('/api/products', methods=['GET'])
-@limiter.limit("30 per minute")
-def api_get_products():
-    try:
-        sb = get_supabase()
-        result = sb.table('products').select('*').execute()
-        products = []
-        for p in result.data:
-            durations = p.get('durations', '[]')
-            if isinstance(durations, str):
-                durations = json.loads(durations)
-            products.append({'id': p['id'], 'name': p['name'], 'durations': durations})
-        return jsonify({'products': products})
-    except Exception as e:
-        return make_error_response(e)
-
-# ==================== API: GENERATE KEYS ====================
-@app.route('/api/generate-keys', methods=['POST'])
-@limiter.limit("30 per minute")
-def api_generate_keys():
-    try:
-        session_username = session.get('username')
-        if not session_username:
-            return jsonify({'error': 'Not authenticated'}), 401
-        data = request.get_json()
-        username = session_username
-        product_id = data.get('product_id')
-        days = data.get('days')
-        quantity = data.get('quantity', 1)
-        if not all([product_id, days]):
-            return jsonify({'error': 'Missing parameters'}), 400
-
-        sb = get_supabase()
-        user_result = sb.table('users').select('*').eq('username', username).execute()
-        if not user_result.data:
-            return jsonify({'error': 'User not found'}), 404
-        user = user_result.data[0]
-        if user.get('is_banned', False):
-            return jsonify({'error': 'Account banned'}), 403
-
-        prod_result = sb.table('products').select('*').eq('id', product_id).execute()
-        if not prod_result.data:
-            return jsonify({'error': 'Product not found'}), 404
-        product = prod_result.data[0]
-        durations = product.get('durations', '[]')
-        if isinstance(durations, str):
-            durations = json.loads(durations)
-
-        days = int(days)
-        quantity = min(int(quantity), 50)
-        if quantity < 1 or days < 1 or days > 3650:
-            return jsonify({'error': 'Invalid parameters'}), 400
-        
-        duration = None
-        for d in durations:
-            if int(d['days']) == days:
-                duration = d
-                break
-        if not duration:
-            return jsonify({'error': 'Invalid duration'}), 400
-
-        total_cost = float(duration['price']) * int(quantity)
-        user_balance = float(user['balance'])
-        if user_balance < total_cost:
-            return jsonify({'error': f'Insufficient balance. Need ${total_cost:.2f}, have ${user_balance:.2f}'}), 400
-
-        pool_result = sb.table('key_pool').select('*').eq('product_id', product_id).eq('days', days).limit(quantity).execute()
-        pool_keys = pool_result.data if pool_result.data else []
-        if not pool_keys:
-            return jsonify({'error': 'No keys available, please try again later.'}), 400
-        if len(pool_keys) < quantity:
-            return jsonify({'error': f'Not enough keys. Only {len(pool_keys)} in stock.'}), 400
-
-        generated_keys = []
-        key_ids_to_delete = []
-        for pk in pool_keys[:quantity]:
-            generated_keys.append(pk['key_code'])
-            key_ids_to_delete.append(pk['id'])
-
-        # Delete used keys from pool in batch
-        for kid in key_ids_to_delete:
-            sb.table('key_pool').delete().eq('id', kid).execute()
-
-        # Update balance
-        new_balance = user_balance - total_cost
-        sb.table('users').update({'balance': new_balance}).eq('username', username).execute()
-
-        # Batch insert key history
-        history_batch = [
-            {'username': username, 'key_code': k, 'product_name': product['name'], 'days': days, 'price': float(duration['price'])}
-            for k in generated_keys
-        ]
-        sb.table('key_history').insert(history_batch).execute()
-
-        # Record transaction
-        sb.table('transactions').insert({
-            'username': username, 'type': 'Key Purchase', 'amount': -total_cost
-        }).execute()
-
-        return jsonify({'success': True, 'keys': generated_keys, 'new_balance': new_balance, 'total_cost': total_cost})
-    except Exception as e:
-        return make_error_response(e)
-
-# ==================== API: KEY HISTORY ====================
-@app.route('/api/key-history', methods=['GET'])
-@limiter.limit("20 per minute")
-def api_key_history():
-    try:
-        session_username = session.get('username')
-        requested_username = request.args.get('username')
-        if not session_username:
-            return jsonify({'error': 'Not authenticated'}), 401
-        username = requested_username or session_username
-        if username != session_username:
-            return jsonify({'error': 'Unauthorized'}), 403
-        sb = get_supabase()
-        result = sb.table('key_history').select('*').eq('username', username).order('created_at', desc=True).execute()
-        return jsonify({'history': result.data})
-    except Exception as e:
-        return make_error_response(e)
-
-# ==================== API: TRANSACTIONS ====================
-@app.route('/api/transactions', methods=['GET'])
-@limiter.limit("20 per minute")
-def api_transactions():
-    try:
-        session_username = session.get('username')
-        requested_username = request.args.get('username')
-        if not session_username:
-            return jsonify({'error': 'Not authenticated'}), 401
-        username = requested_username or session_username
-        if username != session_username:
-            return jsonify({'error': 'Unauthorized'}), 403
-        sb = get_supabase()
-        result = sb.table('transactions').select('*').eq('username', username).order('created_at', desc=True).execute()
-        return jsonify({'transactions': result.data})
-    except Exception as e:
-        return make_error_response(e)
-
-# ==================== API: ANNOUNCEMENTS ====================
-@app.route('/api/announcement', methods=['GET'])
-def api_get_announcement():
-    try:
-        sb = get_supabase()
-        result = sb.table('announcements').select('*').order('created_at', desc=True).limit(1).execute()
-        if result.data:
-            return jsonify({'announcement': result.data[0]})
-        return jsonify({'announcement': None})
-    except Exception as e:
-        return make_error_response(e)
-
-# ==================== API: SECURITY ====================
-@app.route('/api/security-alert', methods=['POST'])
-@limiter.limit("20 per minute")
-def api_security_alert():
-    try:
-        ip = get_client_ip()
-        data = request.get_json()
-        event = data.get('event', 'Unknown')
-        is_devtools = data.get('is_devtools', False)
-        send_telegram_alert(event, ip)
-        if is_devtools:
-            devtools_attempts[ip] = devtools_attempts.get(ip, 0) + 1
-            if devtools_attempts[ip] >= MAX_DEVTOOLS_ATTEMPTS:
-                ban_ip(ip, permanent=True, reason=f"DevTools opened {devtools_attempts[ip]} times")
-                return jsonify({'banned': True}), 403
-        return jsonify({'success': True})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/get-client-ip', methods=['GET'])
-def api_get_client_ip():
-    return jsonify({'ip': get_client_ip()})
-
-@app.route('/api/check-ban', methods=['GET'])
-def api_check_ban():
-    ip = get_client_ip()
-    return jsonify({'banned': is_ip_banned(ip), 'ip': ip})
-
-@app.route('/api/logout', methods=['POST'])
-def api_logout():
-    session.clear()
-    return jsonify({'success': True})
-
-@app.route('/api/check-session', methods=['GET'])
-def api_check_session():
-    try:
-        ip = get_client_ip()
-        if is_ip_banned(ip):
-            return jsonify({'active': False, 'reason': 'IP_BANNED'}), 403
-        session_username = session.get('username')
-        session_token = session.get('user_token')
-        if session_username and session_token:
-            try:
-                sb = get_supabase()
-                result = sb.table('users').select('username, balance, is_banned').eq('username', session_username).execute()
-                if result.data and not result.data[0].get('is_banned', False):
-                    user = result.data[0]
-                    return jsonify({'active': True, 'type': 'user', 'username': user['username'], 'balance': user['balance']})
-            except:
-                pass
-        admin_token = session.get('admin_token')
-        is_admin = session.get('is_admin')
-        if admin_token and is_admin and admin_token in active_admin_tokens:
-            return jsonify({'active': True, 'type': 'admin'})
-        return jsonify({'active': False})
-    except:
-        return jsonify({'active': False}), 500
-
-@app.route('/api/verify-device', methods=['POST'])
-@limiter.limit("10 per minute")
-def api_verify_device():
-    try:
-        ip = get_client_ip()
-        data = request.get_json() or {}
-        fingerprint = data.get('fingerprint', '')
-        user_agent = request.headers.get('User-Agent', '')
-        origin = request.headers.get('Origin', '') or request.headers.get('Referer', '')
-        checks = {}
-        if is_ip_banned(ip):
-            return jsonify({'verified': False, 'checks': {'ip': False}}), 403
-        checks['ip'] = True
-        # ===== CHANGE THESE TO YOUR DOMAINS =====
-        allowed_origins = ['teamsensi.shop', 'YOUR_SERVER_HOST.com', 'localhost', '127.0.0.1']
-        checks['domain'] = not origin or any(d in origin for d in allowed_origins)
-        suspicious_uas = ['sqlmap', 'nikto', 'nmap', 'masscan', 'dirbuster']
-        checks['user_agent'] = bool(user_agent) and not any(s in user_agent.lower() for s in suspicious_uas)
-        checks['fingerprint'] = bool(fingerprint) and len(fingerprint) >= 8
-        checks['rate'] = True
-        all_passed = all(checks.values())
-        if not all_passed:
-            failed = [k for k, v in checks.items() if not v]
-            send_telegram_alert(f"Device verification FAILED: {', '.join(failed)}", ip)
-        return jsonify({'verified': all_passed, 'checks': checks})
-    except Exception as e:
-        return jsonify({'verified': False}), 500
-
-# ==================== API: TEST TELEGRAM ====================
-@app.route('/api/admin/test-telegram', methods=['POST'])
-@admin_required
-def test_telegram():
-    try:
-        bot_token, chat_id = get_telegram_config()
-        if not bot_token or not chat_id:
-            return jsonify({'error': 'Telegram not configured'}), 400
-        text = f"\U0001F7E2 <b>TEST NOTIFICATION</b>\n\n\U0001F4C5 <b>Time:</b> {datetime.now(timezone.utc).strftime('%d/%m/%Y %I:%M %p UTC')}\nNotifications are working!"
-        url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
-        resp = requests.post(url, json={'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}, timeout=10)
-        if resp.ok:
-            return jsonify({'success': True, 'message': 'Test notification sent!'})
-        return jsonify({'error': f'Telegram API error: {resp.json().get("description", "Unknown")}'}), 400
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# ==================== ADMIN API ROUTES ====================
-@app.route('/api/admin/users', methods=['GET'])
-@admin_required
-def admin_get_users():
-    try:
-        sb = get_supabase()
-        users = sb.table('users').select('*').execute()
-        key_history = sb.table('key_history').select('username').execute()
-        key_counts = {}
-        for kh in key_history.data:
-            u = kh['username']
-            key_counts[u] = key_counts.get(u, 0) + 1
-        result = []
-        for u in users.data:
-            result.append({
-                'username': u['username'], 'balance': u['balance'],
-                'is_banned': u['is_banned'], 'key_count': key_counts.get(u['username'], 0)
-            })
-        return jsonify({'users': result})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/add-user', methods=['POST'])
-@admin_required
-def admin_add_user():
-    try:
-        data = request.get_json()
-        username = (data.get('username') or '').strip()
-        password = data.get('password') or ''
-        if not username or not password:
-            return jsonify({'error': 'Missing username or password'}), 400
-        sb = get_supabase()
-        existing = sb.table('users').select('username').eq('username', username).execute()
-        if existing.data:
-            return jsonify({'error': 'User already exists'}), 409
-        sb.table('users').insert({'username': username, 'password': hash_password(password), 'balance': 0, 'is_banned': False}).execute()
-        return jsonify({'success': True, 'message': 'User added!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/delete-user', methods=['POST'])
-@admin_required
-def admin_delete_user():
-    try:
-        data = request.get_json()
-        username = data.get('username')
-        if not username:
-            return jsonify({'error': 'Missing username'}), 400
-        sb = get_supabase()
-        sb.table('users').delete().eq('username', username).execute()
-        return jsonify({'success': True, 'message': 'User deleted!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/toggle-ban', methods=['POST'])
-@admin_required
-def admin_toggle_ban():
-    try:
-        data = request.get_json()
-        username = data.get('username')
-        if not username:
-            return jsonify({'error': 'Missing username'}), 400
-        sb = get_supabase()
-        result = sb.table('users').select('is_banned').eq('username', username).execute()
-        if not result.data:
-            return jsonify({'error': 'User not found'}), 404
-        new_status = not result.data[0]['is_banned']
-        sb.table('users').update({'is_banned': new_status}).eq('username', username).execute()
-        return jsonify({'success': True, 'banned': new_status, 'message': f'User {"banned" if new_status else "unbanned"}!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/edit-password', methods=['POST'])
-@admin_required
-def admin_edit_password():
-    try:
-        data = request.get_json()
-        username = data.get('username')
-        new_password = data.get('password')
-        if not username or not new_password:
-            return jsonify({'error': 'Missing data'}), 400
-        sb = get_supabase()
-        sb.table('users').update({'password': hash_password(new_password)}).eq('username', username).execute()
-        return jsonify({'success': True, 'message': 'Password updated!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/modify-balance', methods=['POST'])
-@admin_required
-def admin_modify_balance():
-    try:
-        data = request.get_json()
-        username = data.get('username')
-        amount = data.get('amount', 0)
-        action = data.get('action')
-        if not username or not amount or not action:
-            return jsonify({'error': 'Missing data'}), 400
-        sb = get_supabase()
-        result = sb.table('users').select('balance').eq('username', username).execute()
-        if not result.data:
-            return jsonify({'error': 'User not found'}), 404
-        current = float(result.data[0]['balance'])
-        amount = float(amount)
-        if action == 'add':
-            new_balance = current + amount
-            sb.table('transactions').insert({'username': username, 'type': 'Deposit', 'amount': amount}).execute()
-        else:
-            new_balance = max(0, current - amount)
-            sb.table('transactions').insert({'username': username, 'type': 'Deduction', 'amount': -amount}).execute()
-        sb.table('users').update({'balance': new_balance}).eq('username', username).execute()
-        return jsonify({'success': True, 'new_balance': new_balance, 'message': f'Balance updated!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/products', methods=['GET'])
-@admin_required
-def admin_get_products():
-    try:
-        sb = get_supabase()
-        result = sb.table('products').select('*').execute()
-        products = []
-        for p in result.data:
-            durations = p.get('durations', '[]')
-            if isinstance(durations, str):
-                durations = json.loads(durations)
-            products.append({'id': p['id'], 'name': p['name'], 'durations': durations})
-        return jsonify({'products': products})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/add-product', methods=['POST'])
-@admin_required
-def admin_add_product():
-    try:
-        data = request.get_json()
-        name = (data.get('name') or '').strip()
-        days = data.get('days')
-        price = data.get('price')
-        if not name or not days or price is None:
-            return jsonify({'error': 'Missing data'}), 400
-        sb = get_supabase()
-        existing = sb.table('products').select('*').eq('name', name).execute()
-        if existing.data:
-            product = existing.data[0]
-            durations = product.get('durations', [])
-            if isinstance(durations, str):
-                durations = json.loads(durations)
-            for d in durations:
-                if int(d['days']) == int(days):
-                    return jsonify({'error': 'Duration already exists'}), 409
-            durations.append({'days': int(days), 'price': float(price)})
-            # Pass list directly - Supabase JSONB handles it natively
-            sb.table('products').update({'durations': durations}).eq('id', product['id']).execute()
-        else:
-            # Pass list directly - NOT json.dumps (JSONB column)
-            sb.table('products').insert({'name': name, 'durations': [{'days': int(days), 'price': float(price)}]}).execute()
-        return jsonify({'success': True, 'message': 'Product added!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/delete-product', methods=['POST'])
-@admin_required
-def admin_delete_product():
-    try:
-        data = request.get_json()
-        product_id = data.get('product_id')
-        if not product_id:
-            return jsonify({'error': 'Missing product ID'}), 400
-        sb = get_supabase()
-        sb.table('products').delete().eq('id', product_id).execute()
-        return jsonify({'success': True, 'message': 'Product deleted!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/key-pool', methods=['GET'])
-@admin_required
-def admin_get_key_pool():
-    try:
-        product_id = request.args.get('product_id')
-        sb = get_supabase()
-        if product_id:
-            result = sb.table('key_pool').select('*').eq('product_id', product_id).execute()
-        else:
-            result = sb.table('key_pool').select('*').execute()
-        return jsonify({'keys': result.data})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/add-keys', methods=['POST'])
-@admin_required
-def admin_add_keys():
-    try:
-        data = request.get_json()
-        product_id = data.get('product_id')
-        days = data.get('days')
-        keys = data.get('keys', [])
-        if not product_id or not days or not keys:
-            return jsonify({'error': 'Missing data'}), 400
-        sb = get_supabase()
-        # Batch insert all keys at once for speed
-        batch = []
-        for k in keys:
-            k = k.strip()
-            if k:
-                batch.append({'product_id': product_id, 'key_code': k, 'days': int(days)})
-        if not batch:
-            return jsonify({'error': 'No valid keys provided'}), 400
-        added = 0
-        # Insert in chunks of 50 to avoid payload limits
-        for i in range(0, len(batch), 50):
-            chunk = batch[i:i+50]
-            try:
-                sb.table('key_pool').upsert(chunk, on_conflict='product_id,key_code').execute()
-                added += len(chunk)
-            except Exception as e:
-                # Fallback: insert one by one
-                for item in chunk:
-                    try:
-                        sb.table('key_pool').insert(item).execute()
-                        added += 1
-                    except:
-                        pass
-        return jsonify({'success': True, 'added': added, 'message': f'{added} key(s) added!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/remove-key', methods=['POST'])
-@admin_required
-def admin_remove_key():
-    try:
-        data = request.get_json()
-        key_id = data.get('key_id')
-        if not key_id:
-            return jsonify({'error': 'Missing key ID'}), 400
-        sb = get_supabase()
-        sb.table('key_pool').delete().eq('id', key_id).execute()
-        return jsonify({'success': True, 'message': 'Key removed!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/banned-ips', methods=['GET'])
-@admin_required
-def admin_get_banned_ips():
-    try:
-        sb = get_supabase()
-        result = sb.table('banned_ips').select('*').execute()
-        return jsonify({'banned_ips': result.data})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/ban-ip', methods=['POST'])
-@admin_required
-def admin_ban_ip():
-    try:
-        data = request.get_json()
-        ip = (data.get('ip') or '').strip()
-        duration = data.get('duration', 'permanent')
-        custom_minutes = data.get('custom_minutes', 0)
-        if not ip:
-            return jsonify({'error': 'Missing IP'}), 400
-        if duration == 'permanent':
-            ban_ip(ip, permanent=True, reason="Admin ban - permanent")
-        elif duration == 'custom':
-            ban_ip(ip, minutes=custom_minutes, reason=f"Admin ban - {custom_minutes} min")
-        else:
-            minutes = int(duration.replace('temp-', ''))
-            ban_ip(ip, minutes=minutes, reason=f"Admin ban - {minutes} min")
-        return jsonify({'success': True, 'message': 'IP blocked!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/unban-ip', methods=['POST'])
-@admin_required
-def admin_unban_ip():
-    try:
-        data = request.get_json()
-        ip = (data.get('ip') or '').strip()
-        if not ip:
-            return jsonify({'error': 'Missing IP'}), 400
-        unban_ip(ip)
-        return jsonify({'success': True, 'message': f'IP {ip} fully unblocked (memory + database)!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/unban-all', methods=['POST'])
-@admin_required
-def admin_unban_all():
-    """Clear ALL banned IPs from memory and database."""
-    try:
-        unban_all_ips()
-        return jsonify({'success': True, 'message': 'All IPs unblocked from memory and database!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/clear-memory-bans', methods=['POST'])
-@admin_required
-def admin_clear_memory_bans():
-    """Clear only in-memory bans (useful when DB was manually cleaned)."""
-    try:
-        count = len(memory_banned_ips)
-        memory_banned_ips.clear()
-        failed_login_attempts.clear()
-        failed_admin_attempts.clear()
-        devtools_attempts.clear()
-        return jsonify({'success': True, 'message': f'Cleared {count} memory bans + all attempt counters!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/send-announcement', methods=['POST'])
-@admin_required
-def admin_send_announcement():
-    try:
-        data = request.get_json()
-        text = (data.get('text') or '').strip()
-        if not text:
-            return jsonify({'error': 'Missing text'}), 400
-        text = re.sub(r'<[^>]+>', '', text)[:500]
-        sb = get_supabase()
-        sb.table('announcements').delete().neq('id', 0).execute()
-        sb.table('announcements').insert({'content': text}).execute()
-        return jsonify({'success': True, 'message': 'Announcement sent!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/clear-announcement', methods=['POST'])
-@admin_required
-def admin_clear_announcement():
-    try:
-        sb = get_supabase()
-        sb.table('announcements').delete().neq('id', 0).execute()
-        return jsonify({'success': True, 'message': 'Announcement cleared!'})
-    except Exception as e:
-        return make_error_response(e)
-
-# ==================== ADMIN: DEPOSIT AMOUNTS MANAGEMENT ====================
-@app.route('/api/admin/deposit-amounts', methods=['GET'])
-@admin_required
-def admin_get_deposit_amounts():
-    """Get all deposit amounts (active and inactive)."""
-    try:
-        sb = get_supabase()
-        result = sb.table('deposit_amounts').select('*').order('amount').execute()
-        return jsonify({'amounts': result.data})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/add-deposit-amount', methods=['POST'])
-@admin_required
-def admin_add_deposit_amount():
-    """Add a new fixed deposit amount."""
-    try:
-        data = request.get_json()
-        amount = data.get('amount')
-        if not amount:
-            return jsonify({'error': 'Missing amount'}), 400
-        try:
-            amount = float(amount)
-        except:
-            return jsonify({'error': 'Invalid amount'}), 400
-        if amount <= 0 or amount > 100000:
-            return jsonify({'error': 'Amount must be between $0.01 and $100,000'}), 400
-        
-        sb = get_supabase()
-        existing = sb.table('deposit_amounts').select('id').eq('amount', amount).execute()
-        if existing.data:
-            sb.table('deposit_amounts').update({'is_active': True}).eq('amount', amount).execute()
-            return jsonify({'success': True, 'message': f'${amount:.2f} reactivated!'})
-        
-        sb.table('deposit_amounts').insert({'amount': amount, 'is_active': True}).execute()
-        return jsonify({'success': True, 'message': f'${amount:.2f} added!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/delete-deposit-amount', methods=['POST'])
-@admin_required
-def admin_delete_deposit_amount():
-    """Delete a fixed deposit amount."""
-    try:
-        data = request.get_json()
-        amount_id = data.get('id')
-        if not amount_id:
-            return jsonify({'error': 'Missing ID'}), 400
-        sb = get_supabase()
-        sb.table('deposit_amounts').delete().eq('id', amount_id).execute()
-        return jsonify({'success': True, 'message': 'Amount removed!'})
-    except Exception as e:
-        return make_error_response(e)
-
-@app.route('/api/admin/toggle-deposit-amount', methods=['POST'])
-@admin_required
-def admin_toggle_deposit_amount():
-    """Toggle active/inactive status of deposit amount."""
-    try:
-        data = request.get_json()
-        amount_id = data.get('id')
-        if not amount_id:
-            return jsonify({'error': 'Missing ID'}), 400
-        sb = get_supabase()
-        result = sb.table('deposit_amounts').select('is_active').eq('id', amount_id).execute()
-        if not result.data:
-            return jsonify({'error': 'Not found'}), 404
-        new_status = not result.data[0]['is_active']
-        sb.table('deposit_amounts').update({'is_active': new_status}).eq('id', amount_id).execute()
-        return jsonify({'success': True, 'is_active': new_status})
-    except Exception as e:
-        return make_error_response(e)
-
-# ==================== ADMIN: CHANGE PASSWORD & 2FA ====================
-@app.route('/api/admin/change-credentials', methods=['POST'])
-@admin_required
-def admin_change_credentials():
-    """Change admin password and/or 2FA code. Requires secret code to apply."""
-    try:
-        data = request.get_json()
-        secret_code = data.get('secret_code', '')
-        new_password = data.get('new_password', '').strip()
-        new_2fa_code = data.get('new_2fa_code', '').strip()
-        
-        # ===== CHANGE THIS SECRET CODE =====
-        if secret_code != 'Sensi1717SKSPPPPP':
-            return jsonify({'error': 'Invalid secret code. Changes not applied.'}), 403
-        
-        changes = []
-        
-        if new_password:
-            if len(new_password) < 4:
-                return jsonify({'error': 'Password must be at least 4 characters'}), 400
-            new_hash = hash_password(new_password)
-            set_setting('admin_password_hash', new_hash)
-            changes.append('Password updated')
-        
-        if new_2fa_code:
-            if len(new_2fa_code) < 3 or len(new_2fa_code) > 10:
-                return jsonify({'error': '2FA code must be 3-10 characters'}), 400
-            set_setting('admin_2fa_code', new_2fa_code)
-            changes.append('2FA code updated')
-        
-        if not changes:
-            return jsonify({'error': 'No changes provided'}), 400
-        
-        ip = get_client_ip()
-        send_telegram_alert(f"Admin credentials changed: {', '.join(changes)}", ip)
-        
-        return jsonify({'success': True, 'message': '. '.join(changes) + '.'})
-    except Exception as e:
-        return make_error_response(e)
-
-# ==================== CATCH-ALL STATIC ====================
-ALLOWED_STATIC_FILES = {'style.css', 'logic.js', 'data.js', 'favicon.ico', 'binance-qr.png'}
-
-@app.route('/<path:path>')
-def serve(path):
-    if '..' in path or path.startswith('/'):
-        ip = get_client_ip()
-        ban_ip(ip, permanent=True, reason=f"Directory traversal: {path}")
-        return jsonify({'error': 'Forbidden'}), 403
-    if path in ALLOWED_STATIC_FILES:
-        safe_path = os.path.normpath(os.path.join(app.static_folder, path))
-        if safe_path.startswith(os.path.normpath(app.static_folder)) and os.path.isfile(safe_path):
-            return send_from_directory(app.static_folder, path)
-    return jsonify({'error': 'Not Found'}), 404
-
-@app.errorhandler(429)
-def ratelimit_handler(e):
-    return jsonify({'error': 'Too many requests. Please slow down.'}), 429
-
-@app.errorhandler(500)
-def internal_error(e):
-    return jsonify({'error': 'Internal server error'}), 500
-
-@app.errorhandler(404)
-def not_found(e):
-    return jsonify({'error': 'Not Found'}), 404
-
-# ==================== MAIN ====================
-if __name__ == '__main__':
-    try:
-        sb = get_supabase()
-        logger.info("Server starting with Supabase connection")
-        
-        # 1. Clean wrongly banned infrastructure IPs
-        try:
-            all_bans = sb.table('banned_ips').select('*').execute()
-            cleaned = 0
-            loaded = 0
-            for ban in (all_bans.data or []):
-                ip = ban.get('ip_address', '')
-                if is_cloudflare_ip(ip) or ip.startswith('10.') or ip.startswith('172.16.') or ip == '127.0.0.1':
-                    sb.table('banned_ips').delete().eq('ip_address', ip).execute()
-                    cleaned += 1
-                else:
-                    # 2. Sync DB bans to memory for instant checking
-                    banned_until = ban.get('banned_until')
-                    if banned_until is None:
-                        memory_banned_ips[ip] = {'permanent': True, 'until': 0}
-                        loaded += 1
-                    else:
-                        try:
-                            ban_dt = datetime.fromisoformat(banned_until.replace('Z', '+00:00'))
-                            if ban_dt > datetime.now(timezone.utc):
-                                memory_banned_ips[ip] = {'permanent': False, 'until': ban_dt.timestamp()}
-                                loaded += 1
-                            else:
-                                # Expired ban - clean it
-                                sb.table('banned_ips').delete().eq('ip_address', ip).execute()
-                                cleaned += 1
-                        except:
-                            memory_banned_ips[ip] = {'permanent': True, 'until': 0}
-                            loaded += 1
-            if cleaned:
-                print(f"[OK] Cleaned {cleaned} expired/invalid banned IPs")
-            print(f"[OK] Loaded {loaded} active bans into memory")
-        except Exception as e:
-            logger.warning(f"Ban sync failed: {e}")
-        
-        # 3. Pre-warm settings cache
-        try:
-            get_setting('admin_password_hash')
-            print("[OK] Settings cache warmed up")
-        except:
-            pass
-            
-    except Exception as e:
-        logger.warning(f"Supabase initial connection failed: {e}")
-
-    server_port = int(os.environ.get('SERVER_PORT', 20837))
-    print(f"[OK] Starting server on port: {server_port}")
-    app.run(host='0.0.0.0', port=server_port, debug=False)
+    depositTimeRemaining = 300; updateDepositTimer();
+    depositTimer = setInterval(function() {
+        depositTimeRemaining--;
+        updateDepositTimer();
+        if (depositTimeRemaining <= 0) {
+            clearInterval(depositTimer); depositTimer = null;
+            closeDepositOverlay();
+            showToast('error', 'Deposit expired. Try again.');
+        }
+    }, 1000);
+}
+
+function renderDepositAmountsGrid() {
+    const grid = document.getElementById('deposit-amounts-grid');
+    if (depositFixedAmounts.length === 0) {
+        grid.innerHTML = '<div style="color:#6b7280;font-size:13px;text-align:center;padding:10px;">No deposit amounts available.</div>';
+        return;
+    }
+    grid.innerHTML = depositFixedAmounts.map(a => 
+        `<button class="deposit-amount-btn" data-amount="${a.amount}" onclick="selectDepositAmount(${a.amount}, this)">$${parseFloat(a.amount).toFixed(2)}</button>`
+    ).join('');
+}
+
+function selectDepositAmount(amount, btn) {
+    // Deselect all
+    document.querySelectorAll('.deposit-amount-btn').forEach(b => b.classList.remove('selected'));
+    // Select this one
+    btn.classList.add('selected');
+    selectedDepositAmount = amount;
+    document.getElementById('deposit-amount-input').value = amount;
+}
+
+function updateDepositTimer() {
+    const minutes = Math.floor(depositTimeRemaining / 60);
+    const seconds = depositTimeRemaining % 60;
+    const label = document.getElementById('deposit-timer-label');
+    const fill = document.getElementById('deposit-timer-fill');
+    label.innerText = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    const pct = (depositTimeRemaining / 300) * 100;
+    fill.style.width = pct + '%';
+    fill.classList.remove('warning', 'danger');
+    if (pct <= 20) fill.classList.add('danger');
+    else if (pct <= 40) fill.classList.add('warning');
+}
+
+function downloadQRCode() {
+    const link = document.createElement('a');
+    link.href = '/binance-qr.png';
+    link.download = 'Binance-QR-Code.png';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    showToast('success', 'QR Code downloading...');
+}
+
+function copyBinanceId() {
+    navigator.clipboard.writeText('YOUR_BINANCE_ID').then(function() {
+        showToast('success', 'Binance ID copied!');
+    }).catch(function() {
+        const el = document.createElement('textarea'); el.value = 'YOUR_BINANCE_ID';
+        document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el);
+        showToast('success', 'Binance ID copied!');
+    });
+}
+
+async function confirmDeposit() {
+    const amount = parseFloat(document.getElementById('deposit-amount-input').value);
+    if (!amount || !selectedDepositAmount) {
+        showToast('error', 'Please select a deposit amount');
+        return;
+    }
+    const btn = document.getElementById('deposit-btn-confirm');
+    btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Submitting...';
+    try {
+        const result = await api('/api/deposit-request', { method: 'POST', body: JSON.stringify({ username: currentUser.username, amount: amount }) });
+        if (result.success) {
+            if (depositTimer) { clearInterval(depositTimer); depositTimer = null; }
+            document.getElementById('deposit-step-form').classList.add('hidden');
+            document.getElementById('deposit-step-waiting').classList.remove('hidden');
+            document.getElementById('deposit-waiting-amount-text').innerText = '$' + amount.toFixed(2);
+        }
+    } catch (err) {
+        if (err.error === 'COOLDOWN') { showToast('error', err.message || 'Please wait before another request.'); closeDepositOverlay(); }
+        else { showToast('error', err.message || 'Failed to submit.'); }
+    }
+    btn.disabled = false; btn.innerHTML = '<i class="fa-solid fa-check-circle"></i> Confirm Payment';
+}
+
+function cancelDeposit() { closeDepositOverlay(); }
+
+function closeDepositOverlay() {
+    if (depositTimer) { clearInterval(depositTimer); depositTimer = null; }
+    document.getElementById('deposit-overlay').classList.add('hidden');
+}
